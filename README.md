@@ -10,6 +10,8 @@ The project has two parts:
 
 **All data here is synthetic.** See [Provenance](#provenance).
 
+**Full methodology**, covering every formula, assumption and check with worked examples: [docs/METHODOLOGY.md](docs/METHODOLOGY.md). The same page is the *Methodology* tab in the dashboard.
+
 # Part 1: one booking window
 
 ## Findings
@@ -181,7 +183,7 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
 - **Settings.** The sidebar holds every setting for scenario A:
   - specialty, number of surgeons, lists per surgeon and list length;
   - operating weeks a year and extra lists per week;
-  - demand;
+  - demand, as referrals a week for the whole specialty, shared between the surgeons, so adding surgeons adds capacity rather than demand;
   - how full lists are booked (to average times at a chosen fill %, or to a Monte Carlo overrun limit);
   - booking order and how much history the planner has;
   - changeover time and the on-the-day cancellation rule;
@@ -235,7 +237,7 @@ To deploy it on Streamlit Community Cloud:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                                   # 27 tests
+pytest                                   # 28 tests
 python scripts/run_experiment.py         # Part 1: about 15 seconds; writes results/
 python scripts/run_experiment.py --history-cases 200 --out results/history200
 python scripts/run_capacity.py           # Part 2: about 1.5 minutes on 2 cores; writes results/capacity/
@@ -258,7 +260,8 @@ requirements.txt            dependencies for Streamlit Community Cloud
 scripts/run_experiment.py   Part 1 comparison across synthetic worlds, tables and figures
 scripts/run_capacity.py     Part 2 capacity scenarios by specialty, tables and figures
 scripts/run_differentials.py  Part 3 first-come-first-served vs optimised booking, by specialty
-docs/                       dashboard screenshots
+docs/METHODOLOGY.md         full methodology (also the dashboard's Methodology tab)
+docs/*.png                  dashboard screenshots
 tests/                      checks on the evaluator, duration fit, schedulers, rolling simulation and world generator
 results/                    output of the runs above (Part 2 in results/capacity/, Part 3 in results/differentials/)
 ```

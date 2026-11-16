@@ -73,3 +73,15 @@ def test_more_lists_do_not_make_waits_worse(world):
     res = [summarise_run(simulate(world, cfg := RollingConfig(extra_lists=e, **SHORT), 5, pts), cfg)["cohort_within_6wk"]
            for e in (0.0, 1.0, 2.0)]
     assert res[0] <= res[1] + 0.02 and res[1] <= res[2] + 0.02
+
+
+def test_referrals_fix_demand_whatever_the_number_of_surgeons():
+    from theatre_sched.rolling import implied_load
+    for n in (3, 6, 9):
+        w = make_world(WorldConfig(specialty="ent", n_surgeons=n), seed=4)
+        assert arrival_rates(w, RollingConfig(referrals_per_week=30)).sum() == pytest.approx(30)
+    w = make_world(WorldConfig(specialty="ent", n_surgeons=6), seed=4)
+    assert implied_load(w, RollingConfig(load=0.85)) == pytest.approx(0.85)
+    # the same referrals need a smaller share of theatre time when there are more surgeons
+    w9 = make_world(WorldConfig(specialty="ent", n_surgeons=9), seed=4)
+    assert implied_load(w9, RollingConfig(referrals_per_week=30)) < implied_load(w, RollingConfig(referrals_per_week=30))

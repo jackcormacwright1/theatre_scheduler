@@ -66,6 +66,8 @@ class RollingConfig:
     session_minutes: float = 480.0
     turnaround: float = 15.0
     load: float = 0.85  # demand / baseline session time actually available (after leave), at a 15-minute changeover
+    referrals_per_week: float | None = None  # if set, demand is this many patients a week for the whole
+    # specialty, shared equally between the surgeons, and ``load`` is ignored
     working_weeks: int = 42  # weeks a year each surgeon operates; leave taken in two-week blocks
     alpha: float = 0.10  # booking limit on each list's estimated P(overrun)
     overrun_tolerance: float = 30.0  # minutes past session end the team will accept before cancelling
@@ -92,24 +94,46 @@ class Patients:
     plan: np.ndarray  # the planner's Monte Carlo draws, one row per patient
 
 
-def arrival_rates(world: World, cfg: RollingConfig, reference_turnaround: float = 15.0) -> np.ndarray:
-    """Patients per week for each surgeon, so that demand = ``load`` x their baseline session time.
-
-    Demand is in patients, fixed at the reference changeover time, so that a scenario with
-    faster changeovers sees the same patients rather than more of them.
-    """
+def _minutes_per_case(world: World, reference_turnaround: float) -> np.ndarray:
+    """Expected theatre minutes per case for each surgeon (true durations, their case mix, plus changeover)."""
     truth = world.true_params.copy()
     truth["mean_min"] = np.exp(truth["mu"] + 0.5 * truth["sigma"] ** 2)
     share = world.procedures.set_index("procedure")["referral_share"]
-    rates = []
+    out = []
     for s in sorted(truth["surgeon"].unique(), key=lambda x: int(x[1:])):
         t = truth[truth.surgeon == s]
         w = share.loc[t["procedure"]].to_numpy()
         w = w / w.sum()
-        minutes_per_case = float(np.sum(w * (t["mean_min"].to_numpy() + reference_turnaround)))
-        available = cfg.lists_per_surgeon * cfg.session_minutes * cfg.working_weeks / 52
-        rates.append(cfg.load * available / minutes_per_case)
-    return np.array(rates)
+        out.append(float(np.sum(w * (t["mean_min"].to_numpy() + reference_turnaround))))
+    return np.array(out)
+
+
+def arrival_rates(world: World, cfg: RollingConfig, reference_turnaround: float = 15.0) -> np.ndarray:
+    """Patients added to the list per week, for each surgeon.
+
+    Two ways of setting demand:
+
+    * ``referrals_per_week`` (used by the dashboard): a fixed number of patients a week for the
+      whole specialty, shared equally between the surgeons. Adding surgeons adds capacity, not demand.
+    * ``load`` (used by the Part 2 scripts): each surgeon's demand is ``load`` x the session time
+      they have available after leave, so demand scales with the number of surgeons.
+
+    Demand is in patients, fixed at the reference changeover time, so that a scenario with
+    faster changeovers sees the same patients rather than more of them.
+    """
+    n = world.config.n_surgeons
+    if cfg.referrals_per_week is not None:
+        return np.full(n, cfg.referrals_per_week / n)
+    available = cfg.lists_per_surgeon * cfg.session_minutes * cfg.working_weeks / 52
+    return cfg.load * available / _minutes_per_case(world, reference_turnaround)
+
+
+def implied_load(world: World, cfg: RollingConfig, reference_turnaround: float = 15.0) -> float:
+    """Theatre minutes the demand needs, as a share of the baseline session time available after leave."""
+    rates = arrival_rates(world, cfg, reference_turnaround)
+    needed = float(np.sum(rates * _minutes_per_case(world, reference_turnaround)))
+    available = world.config.n_surgeons * cfg.lists_per_surgeon * cfg.session_minutes * cfg.working_weeks / 52
+    return needed / available
 
 
 def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:

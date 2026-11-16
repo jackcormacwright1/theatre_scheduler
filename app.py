@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from theatre_sched.rolling import POLICIES, RollingConfig, arrival_rates
+from theatre_sched.rolling import POLICIES, RollingConfig, implied_load
 from theatre_sched.scenarios import (
     MEASURE_LABELS,
     MEASURES,
@@ -34,6 +34,10 @@ from theatre_sched.synthetic import WorldConfig, make_world
 
 st.set_page_config(page_title="Theatre list booking simulator", page_icon="🏥", layout="wide")
 
+METHODOLOGY_FILE = Path(__file__).resolve().parent / "docs" / "METHODOLOGY.md"
+METHODOLOGY = (METHODOLOGY_FILE.read_text(encoding="utf-8") if METHODOLOGY_FILE.exists()
+               else "The methodology is in docs/METHODOLOGY.md in the project repository.")
+
 BLUE, ORANGE, AQUA, MUTED = "#2a78d6", "#eb6834", "#1baf7a", "#898781"
 SPECIALTY_NAMES = {"general_surgery": "General surgery", "orthopaedics": "Orthopaedics",
                    "gynaecology": "Gynaecology", "ent": "ENT"}
@@ -43,7 +47,7 @@ POLICY_NAMES = {"in_turn": "In turn (urgent first, then longest wait)",
 RULE_NAMES = {"average": "To average case times, up to a fill %",
               "monte_carlo": "To a Monte Carlo overrun limit"}
 DEFAULTS = {"specialty": "general_surgery", "n_surgeons": 6, "lists_per_surgeon": 1, "session_minutes": 480,
-            "working_weeks": 42, "load_pct": 85, "extra_lists": 0.5, "turnaround": 15, "policy": "in_turn",
+            "working_weeks": 42, "referrals": 24, "extra_lists": 0.5, "turnaround": 15, "policy": "in_turn",
             "booking_rule": "average", "fill_pct": 100, "alpha_pct": 10, "overrun_tolerance": 30, "history_cases": 15}
 B_START = {**DEFAULTS, "booking_rule": "monte_carlo"}
 FIELDS = list(DEFAULTS)
@@ -67,12 +71,13 @@ def cached_needed(scn: dict, seeds: int, threshold: float):
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
-def patients_per_week(specialty: str, n_surgeons: int, lists_per_surgeon: int, session_minutes: float,
-                      working_weeks: int, load: float) -> float:
+def demand_share(specialty: str, n_surgeons: int, lists_per_surgeon: int, session_minutes: float,
+                 working_weeks: int, referrals: float) -> float:
+    """Theatre time the referrals need, as a share of the time available after leave (15-minute changeovers)."""
     world = make_world(WorldConfig(specialty=specialty, n_surgeons=n_surgeons), seed=seed_for(specialty, 0))
     cfg = RollingConfig(lists_per_surgeon=lists_per_surgeon, session_minutes=session_minutes,
-                        working_weeks=working_weeks, load=load)
-    return float(arrival_rates(world, cfg).sum())
+                        working_weeks=working_weeks, referrals_per_week=referrals)
+    return implied_load(world, cfg)
 
 
 # ---------------------------------------------------------------- settings
@@ -81,7 +86,8 @@ def scenario_from_state(p: str) -> Scenario:
     return Scenario(
         specialty=g("specialty"), n_surgeons=int(g("n_surgeons")), history_cases=float(g("history_cases")),
         lists_per_surgeon=int(g("lists_per_surgeon")), session_minutes=float(g("session_minutes")),
-        working_weeks=int(g("working_weeks")), load=g("load_pct") / 100, extra_lists=float(g("extra_lists")),
+        working_weeks=int(g("working_weeks")), referrals_per_week=float(g("referrals")),
+        extra_lists=float(g("extra_lists")),
         turnaround=float(g("turnaround")), policy=g("policy"), booking_rule=g("booking_rule"),
         fill_fraction=g("fill_pct") / 100, alpha=g("alpha_pct") / 100,
         overrun_tolerance=float(g("overrun_tolerance")), target_weeks=int(st.session_state["target_weeks"]),
@@ -102,13 +108,14 @@ def controls(p: str, two_columns: bool = False) -> None:
                   help="Saturday lists, given to the surgeons with most patients about to pass target. "
                        "0.25 = one every four weeks.")
     with left, st.expander("Demand", expanded=True):
-        st.slider("Demand (% of available theatre time)", 50, 120, step=5, key=k("load_pct"),
-                  help="Patients added to the list, as a share of the session time available after leave "
-                       "(at a 15-minute changeover).")
-        ppw = patients_per_week(st.session_state[k("specialty")], st.session_state[k("n_surgeons")],
-                                st.session_state[k("lists_per_surgeon")], st.session_state[k("session_minutes")],
-                                st.session_state[k("working_weeks")], st.session_state[k("load_pct")] / 100)
-        st.caption(f"About {ppw:.0f} patients added to the list each week.")
+        st.slider("Referrals added to the waiting list per week", 4, 100, key=k("referrals"),
+                  help="Decisions to operate for the whole specialty, shared equally between the surgeons. "
+                       "Adding surgeons or lists adds capacity, not demand.")
+        share = demand_share(st.session_state[k("specialty")], st.session_state[k("n_surgeons")],
+                             st.session_state[k("lists_per_surgeon")], st.session_state[k("session_minutes")],
+                             st.session_state[k("working_weeks")], st.session_state[k("referrals")])
+        st.caption(f"These need about {100 * share:.0f}% of the theatre time available after leave "
+                   "(before any extra lists, at a 15-minute changeover).")
     with right, st.expander("Booking", expanded=True):
         st.radio("How full lists are booked", list(RULE_NAMES), format_func=RULE_NAMES.get, key=k("booking_rule"))
         avg = st.session_state[k("booking_rule")] == "average"
@@ -227,7 +234,7 @@ def signed(v: float, dec: int, suffix: str = "") -> str:
 # ---------------------------------------------------------------- page
 st.title("Theatre list booking simulator")
 st.caption("Simulates a year of elective theatre booking for one specialty, week by week, on synthetic data. "
-           "Every figure comes from invented, illustrative assumptions (see *About the model*).")
+           "Every figure comes from invented, illustrative assumptions (see *Methodology*).")
 
 with st.sidebar:
     st.header("Simulation")
@@ -243,7 +250,7 @@ tw = st.session_state["target_weeks"]
 thr = st.session_state["threshold_pct"] / 100
 scn_a = scenario_from_state("A")
 
-tab_a, tab_cmp, tab_about = st.tabs(["Scenario A", "Compare A and B", "About the model"])
+tab_a, tab_cmp, tab_about = st.tabs(["Scenario A", "Compare A and B", "Methodology"])
 
 with tab_a:
     with st.spinner("Simulating…"):
@@ -355,29 +362,4 @@ with tab_cmp:
         st.altair_chart(ab_needed_chart(na.curve, nb.curve, thr, tw), width="stretch")
 
 with tab_about:
-    st.markdown(f"""
-**What it simulates.** One specialty's elective theatre lists, week by week: 26 weeks of warm-up, then 52 measured
-weeks. Each surgeon has their own waiting list and their own weekly all-day lists, and takes leave in two-week
-blocks. Patients are added to the list at random (Poisson) at the demand you set. At the start of each week,
-lists are booked; on the day, cases run longest first with their *true* durations, and a case is cancelled if it's
-expected to finish too late. Cancelled patients go back on the list with their clock running.
-
-**Booking rules.** *To average case times* assumes each case takes its surgeon's historical average and fills the
-list to the percentage you set: with booking order *in turn*, this is first come, first served. *To a Monte Carlo
-overrun limit* simulates each candidate list hundreds of times using the planner's duration model and allows it
-only if the estimated chance of overrunning is within the limit. The planner's model is estimated from each
-surgeon's past cases, so it's only as good as that history.
-
-**Three ways of measuring the target.** *Still waiting* is how the national RTT standard is measured; holding
-patients who are within target flatters it. *Treated* can be flattered by treating short waiters first. *Added to
-list* follows each new patient until the outcome is known, and only treating people on time improves it.
-
-**Utilisation** is touch time: patient-in-theatre minutes inside the session, excluding changeovers and overruns.
-
-**Caveats.** Everything is synthetic and illustrative: procedure times, surgeon differences, demand and leave are
-invented. Patients wait for their own consultant (no pooled lists), demand is steady (no seasonality or winter
-pressure), and the planner doesn't learn as cases accumulate. Use it to understand mechanisms and trade-offs, not
-to size a real service.
-
-The model, findings and code are written up in the project's README.
-""")
+    st.markdown(METHODOLOGY)

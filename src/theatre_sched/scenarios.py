@@ -46,7 +46,8 @@ class Scenario:
     lists_per_surgeon: int = 1
     session_minutes: float = 480.0
     working_weeks: int = 42
-    load: float = 0.85  # demand as a share of available session time
+    load: float = 0.85  # demand as a share of available session time (used if referrals_per_week is None)
+    referrals_per_week: float | None = None  # demand as patients a week for the whole specialty
     extra_lists: float = 0.0
     turnaround: float = 15.0
     policy: str = "in_turn"
@@ -65,6 +66,7 @@ class Scenario:
         return RollingConfig(
             lists_per_surgeon=self.lists_per_surgeon, extra_lists=self.extra_lists,
             session_minutes=self.session_minutes, turnaround=self.turnaround, load=self.load,
+            referrals_per_week=self.referrals_per_week,
             working_weeks=self.working_weeks, alpha=self.alpha, overrun_tolerance=self.overrun_tolerance,
             target_days=7 * self.target_weeks, urgent_target_days=min(28, 7 * self.target_weeks),
             urgent_share=self.urgent_share, policy=self.policy, booking_rule=self.booking_rule,
