@@ -1,0 +1,5 @@
+# For Streamlit Community Cloud (the app adds src/ to the path itself)
+streamlit>=1.50
+altair>=5
+numpy>=1.24
+pandas>=2.0
