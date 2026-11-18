@@ -110,6 +110,8 @@ st.markdown(f"""
 .kpi .icon {{ display: inline-flex; width: 1.05rem; height: 1.05rem; border-radius: 50%; color: #fff;
               font-size: 0.72rem; font-weight: 700; align-items: center; justify-content: center; }}
 .kpi .note {{ color: {MUTED}; font-size: 0.78rem; margin-top: 0.45rem; line-height: 1.35; }}
+.kpi .value {{ white-space: nowrap; }}
+@media (max-width: 1100px) {{ .kpi .value {{ font-size: 1.45rem; }} }}
 .callout {{ background: #ffffff; border: 1px solid {GRID}; border-left: 4px solid {BLUE}; border-radius: 8px;
             padding: 0.85rem 1.1rem; margin: 0.3rem 0 1rem; }}
 .chart-note {{ color: {MUTED}; font-size: 0.8rem; margin: -0.3rem 0 0.4rem; }}
