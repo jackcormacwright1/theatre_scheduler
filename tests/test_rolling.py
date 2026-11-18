@@ -85,3 +85,43 @@ def test_referrals_fix_demand_whatever_the_number_of_surgeons():
     # the same referrals need a smaller share of theatre time when there are more surgeons
     w9 = make_world(WorldConfig(specialty="ent", n_surgeons=9), seed=4)
     assert implied_load(w9, RollingConfig(referrals_per_week=30)) < implied_load(w, RollingConfig(referrals_per_week=30))
+
+
+# ---------------------------------------------------------------- starting from today's waiting list
+from theatre_sched.rolling import starting_waits, weeks_to_target  # noqa: E402
+from theatre_sched.scenarios import Scenario, recovery_curve, run  # noqa: E402
+
+
+def test_starting_waits_match_the_profile_asked_for():
+    w = starting_waits(20000, 42, 0.3, 182, np.random.default_rng(0))
+    assert np.mean(w > 42) == pytest.approx(0.3, abs=0.01)
+    assert w.max() <= 183 and w.min() >= 0
+    beyond = w[w > 42]
+    # triangular beyond the target: mean is a third of the way from target to the longest wait
+    assert beyond.mean() == pytest.approx(42 + (182 - 42) / 3, abs=2)
+
+
+def test_weeks_to_target_needs_the_share_to_hold():
+    share = np.array([0.80, 0.96, 0.90, 0.95, 0.96, 0.97, 0.99, 0.98])
+    assert weeks_to_target(share, 0.95) == 4.0  # weeks 4-7 hold; week 2 alone doesn't count
+    assert np.isnan(weeks_to_target(np.full(10, 0.9), 0.95))
+
+
+def test_a_run_from_todays_list_starts_where_asked_and_settled_runs_are_unchanged():
+    scn = Scenario(referrals_per_week=24, start_waiting=200, start_over_target_pct=40, start_longest_weeks=30,
+                   horizon_weeks=26)
+    r = run(scn, 2).per_seed
+    assert (r["waiting_start"] == 200).all()
+    assert r["over_target_start"].between(60, 100).all()
+    assert r["longest_wait_days_start"].le(7 * 30 + 1).all()
+    settled = run(Scenario(referrals_per_week=24), 1).per_seed
+    assert "weeks_to_target" not in settled.columns
+
+
+def test_more_extra_lists_clear_a_backlog_sooner():
+    scn = Scenario(referrals_per_week=24, start_waiting=300, start_over_target_pct=40, start_longest_weeks=40)
+    rec = recovery_curve(scn, seeds=2, grid=(0.0, 1.0, 2.0))
+    c = rec.curve.set_index("extra_lists")
+    assert c.loc[2.0, "over_target_week_26"] < c.loc[0.0, "over_target_week_26"]
+    by = rec.lists_to_meet_by(26)
+    assert np.isnan(by) or 0 <= by <= 2.0

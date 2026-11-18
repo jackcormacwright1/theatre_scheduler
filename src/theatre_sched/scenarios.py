@@ -14,6 +14,10 @@ three 6-week measures it finds where the measure first reaches the target share,
 interpolating between the steps of the sweep, so that a difference in lists needed
 between two scenarios also comes with a paired uncertainty.
 
+``recovery_curve`` is the equivalent for a scenario that starts from today's waiting list: for
+each number of extra lists it reports how many weeks it takes to reach the target, and finds the
+extra lists needed to reach it by a chosen week.
+
 ``match_overrun`` retunes scenario B's booking caution (its Monte Carlo overrun limit or
 its fill percentage) until B's lists overrun about as often as A's, so the two are
 compared like for like.
@@ -58,6 +62,16 @@ class Scenario:
     overrun_tolerance: float = 30.0
     target_weeks: int = 6
     urgent_share: float = 0.10
+    target_share: float = 0.95  # the share within target that counts as meeting it
+    # Start from today's waiting list (None: a settled start with a warm-up, as in Part 2)
+    start_waiting: int | None = None
+    start_over_target_pct: float = 30.0  # % of today's list already past the target
+    start_longest_weeks: float = 26.0  # the longest wait on today's list
+    horizon_weeks: int = 52  # weeks simulated from today
+
+    @property
+    def from_today(self) -> bool:
+        return self.start_waiting is not None
 
     def world_config(self) -> WorldConfig:
         return WorldConfig(specialty=self.specialty, n_surgeons=self.n_surgeons,
@@ -72,6 +86,10 @@ class Scenario:
             target_days=7 * self.target_weeks, urgent_target_days=min(28, 7 * self.target_weeks),
             urgent_share=self.urgent_share, policy=self.policy, booking_rule=self.booking_rule,
             fill_fraction=self.fill_fraction, duration_model=self.duration_model,
+            target_share=self.target_share,
+            **({"weeks_warmup": 0, "weeks_measured": self.horizon_weeks, "start_waiting": int(self.start_waiting),
+                "start_over_target_share": self.start_over_target_pct / 100,
+                "start_longest_days": 7 * self.start_longest_weeks} if self.from_today else {}),
         )
 
 
@@ -147,12 +165,30 @@ COMPARE_METRICS = [
 ]
 
 
+# Extra rows when both scenarios start from today's waiting list.
+RECOVERY_METRICS = [
+    ("Weeks until the target is met (still waiting)", "weeks_to_target", "", 1),
+    ("Patients over target after 13 weeks", "over_target_week_13", "", 0),
+    ("Patients over target after 26 weeks", "over_target_week_26", "", 0),
+    ("Patients over target at the end", "over_target_end", "", 0),
+    ("Patients waiting at the end", "waiting_end", "", 0),
+    ("Weeks until everyone on today's list is treated", "weeks_to_treat_start_list", "", 1),
+    ("Still waiting within target, last 13 weeks", "waiting_within_6wk_final", "%", 1),
+    ("Treated within target, last 13 weeks", "treated_within_6wk_final", "%", 1),
+]
+
+
 def compare(a: ScenarioResult, b: ScenarioResult) -> pd.DataFrame:
-    """Mean of A, mean of B, and the paired difference B - A with +/- two standard errors."""
+    """Mean of A, mean of B, and the paired difference B - A with +/- two standard errors.
+
+    A measure that is undefined in some run (e.g. the target is never met) is reported as NaN."""
     n = min(len(a.per_seed), len(b.per_seed))
     pa, pb = a.per_seed.iloc[:n], b.per_seed.iloc[:n]
     rows = []
-    for label, key, unit, dec in COMPARE_METRICS:
+    metrics = list(COMPARE_METRICS)
+    if "weeks_to_target" in pa.columns and "weeks_to_target" in pb.columns:
+        metrics = RECOVERY_METRICS + metrics
+    for label, key, unit, dec in metrics:
         scale = 100.0 if unit == "%" else 1.0
         va, vb = scale * pa[key].to_numpy(), scale * pb[key].to_numpy()
         d = vb - va
@@ -224,6 +260,58 @@ def compare_lists_needed(a: ListsNeeded, b: ListsNeeded) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@dataclass
+class Recovery:
+    curve: pd.DataFrame  # per extra-lists level: mean weeks to target (runs reaching it), share of runs reaching it, ...
+    per_seed: pd.DataFrame  # one row per seed and level
+    horizon_weeks: int
+
+    def lists_to_meet_by(self, week: float) -> float:
+        """Extra lists a week needed to meet the target by ``week``: per seed, the first level where it
+        does, interpolating linearly in weeks-to-target between levels; then the mean over seeds.
+        NaN if some run doesn't manage it within the sweep."""
+        out = []
+        for _, g in self.per_seed.groupby("seed"):
+            g = g.sort_values("extra_lists")
+            x, y = g["extra_lists"].to_numpy(), g["weeks_to_target"].to_numpy()
+            hit = np.flatnonzero(np.nan_to_num(y, nan=np.inf) <= week)
+            if len(hit) == 0:
+                return np.nan
+            k = hit[0]
+            if k == 0 or not np.isfinite(y[k - 1]):
+                out.append(float(x[k]))
+            else:
+                out.append(float(x[k - 1] + (y[k - 1] - week) / (y[k - 1] - y[k]) * (x[k] - x[k - 1])))
+        return float(np.mean(out))
+
+
+def recovery_curve(scn: Scenario, seeds: int = 5,
+                   grid: tuple[float, ...] = tuple(np.round(np.arange(0, 3.01, 0.25), 2))) -> Recovery:
+    """For a scenario that starts from today's list: sweep extra lists a week and record how long
+    the recovery takes."""
+    if not scn.from_today:
+        raise ValueError("recovery_curve needs a scenario that starts from today's waiting list")
+    setups = [_setup(scn, rep) for rep in range(seeds)]
+    rows = []
+    for extra in grid:
+        cfg = replace(scn, extra_lists=float(extra)).rolling_config()
+        for rep, (seed, world, pts) in enumerate(setups):
+            r = summarise_run(simulate(world, cfg, seed, pts), cfg)
+            rows.append({"extra_lists": float(extra), "seed": rep,
+                         **{k: r[k] for k in ("weeks_to_target", "over_target_week_26", "over_target_end",
+                                              "weeks_to_treat_start_list", "touch_utilisation", "overrun_rate")}})
+    per_seed = pd.DataFrame(rows)
+    curve = per_seed.groupby("extra_lists").agg(
+        weeks_to_target=("weeks_to_target", "mean"),
+        share_reaching=("weeks_to_target", lambda v: float(np.isfinite(v).mean())),
+        over_target_week_26=("over_target_week_26", "mean"),
+        over_target_end=("over_target_end", "mean"),
+        touch_utilisation=("touch_utilisation", "mean"),
+        overrun_rate=("overrun_rate", "mean"),
+    ).reset_index()
+    return Recovery(curve, per_seed, scn.horizon_weeks)
+
+
 def match_overrun(target_rate: float, scn: Scenario, seeds: int = 5) -> tuple[Scenario, float]:
     """Retune ``scn``'s booking caution so its lists overrun about as often as ``target_rate``.
 
@@ -242,6 +330,13 @@ def match_overrun(target_rate: float, scn: Scenario, seeds: int = 5) -> tuple[Sc
         if abs(rate - target_rate) < best_gap:
             best, best_rate, best_gap = opt, rate, abs(rate - target_rate)
     return best, best_rate
+
+
+def describe_start(scn: Scenario) -> str:
+    if not scn.from_today:
+        return "a settled waiting list (after a 26-week warm-up)"
+    return (f"today's list of {scn.start_waiting:,} patients, {scn.start_over_target_pct:.0f}% already past "
+            f"{scn.target_weeks} weeks and the longest at {scn.start_longest_weeks:.0f} weeks")
 
 
 def describe(scn: Scenario) -> str:
@@ -272,13 +367,32 @@ def headline(cmp: pd.DataFrame, lists_cmp: pd.DataFrame | None = None, target_we
     def row(key):
         return c.at[key, "difference"], c.at[key, "plus_minus"], int(c.at[key, "decimals"])
 
-    parts = [
+    parts, lead = [], ""
+    if "weeks_to_target" in c.index:
+        d, pm = c.at["weeks_to_target", "difference"], c.at["weeks_to_target", "plus_minus"]
+        a_w, b_w = c.at["weeks_to_target", "A"], c.at["weeks_to_target", "B"]
+        goal = f"the {threshold:.0%} target"
+        if np.isfinite(d):
+            if not np.isfinite(pm) or abs(d) <= pm:
+                lead = (f"A and B meet {goal} at about the same time (B − A: {d:+.1f} ± {pm:.1f} weeks; "
+                        f"week {a_w:.0f} and week {b_w:.0f}). ")
+            else:
+                lead = (f"B meets {goal} {abs(d):.1f} weeks {'later' if d > 0 else 'sooner'} than A "
+                        f"(± {pm:.1f}; week {b_w:.0f} against week {a_w:.0f}). ")
+        elif np.isfinite(b_w):
+            lead = f"B meets {goal} by week {b_w:.0f} in every run; A doesn't. "
+        elif np.isfinite(a_w):
+            lead = f"A meets {goal} by week {a_w:.0f} in every run; B doesn't. "
+        else:
+            lead = f"Neither scenario meets {goal} in every run. "
+        parts.append(phrase(*row("over_target_week_26"), "more", "fewer", "patients over target after 26 weeks"))
+    parts += [
         phrase(*row("treated_per_year"), "more", "fewer", "patients treated a year"),
         phrase(*row("cohort_within_6wk"), "points higher", "points lower",
                f"share of patients treated within {target_weeks} weeks of being added"),
         phrase(*row("overrun_rate"), "points more", "points fewer", "lists overrunning"),
     ]
-    text = "Compared with A, B gives " + "; ".join(p for p in parts if p) + "."
+    text = lead + "Compared with A, B gives " + "; ".join(p for p in parts if p) + "."
     if lists_cmp is not None:
         l = lists_cmp.set_index("key").loc["cohort_within_6wk"]
         if np.isfinite(l["difference"]):

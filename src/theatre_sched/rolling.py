@@ -17,6 +17,15 @@ Each simulated week:
 3. **New patients** are added through the week (Poisson arrivals).
 4. **Measurement** at the end of the week.
 
+Two ways to start:
+
+* **Settled** (the default, used for Part 2): a small starting list, then a 26-week warm-up that isn't
+  measured, so the results describe the steady state the settings lead to, whatever the start.
+* **From today's waiting list** (``start_waiting`` set): the run starts from a list of a given size and
+  wait profile, with no warm-up, and every week is measured. The results then describe the journey
+  from that list: when the target is first met, how fast the patients already over target are
+  cleared, and where the list ends up.
+
 Booking rules (how full a list may be):
 
 * ``monte_carlo`` a list is allowed only if the planner's Monte Carlo estimate of P(list overruns)
@@ -77,7 +86,12 @@ class RollingConfig:
     target_days: int = 42  # the 6-week target
     urgent_target_days: int = 28  # P2 patients
     urgent_share: float = 0.10
-    initial_backlog_weeks: float = 3.0  # starting list: this many weeks of arrivals, waits spread over 6 weeks
+    initial_backlog_weeks: float = 3.0  # settled start: this many weeks of arrivals, waits spread over 6 weeks
+    # Starting from today's list (all None/ignored for a settled start):
+    start_waiting: int | None = None  # patients on the list now, whole specialty
+    start_over_target_share: float = 0.3  # share of them who have already waited longer than target_days
+    start_longest_days: float = 182.0  # the longest wait on the list now
+    target_share: float = 0.95  # the share within target that counts as meeting it (for weeks_to_target)
     plan_samples: int = 500
     policy: str = "in_turn"
     booking_rule: str = "monte_carlo"  # or "average"
@@ -140,26 +154,57 @@ def implied_load(world: World, cfg: RollingConfig, reference_turnaround: float =
     return needed / available
 
 
+def starting_waits(n: int, target_days: float, over_share: float, longest_days: float,
+                   rng: np.random.Generator) -> np.ndarray:
+    """Days already waited by each of ``n`` patients on today's list (at least 1).
+
+    A share ``over_share`` have waited longer than the target. Within the target, waits are spread
+    evenly from 1 day to the target (as they would be with steady arrivals). Beyond it, they thin out
+    linearly to nobody at ``longest_days``: a triangular density, sampled by inverting its CDF,
+    wait = target + (longest - target) * (1 - sqrt(1 - u)) with u uniform on (0, 1).
+    """
+    longest_days = max(longest_days, target_days + 7)
+    over = rng.random(n) < over_share
+    u = rng.random(n)
+    within = u * target_days
+    beyond = target_days + (longest_days - target_days) * (1 - np.sqrt(1 - u))
+    return np.where(over, np.floor(beyond) + 1, np.floor(within) + 1)  # at least a day: already on the list
+
+
 def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
-    """Everyone who will ever be on the list in this run: the starting backlog plus all arrivals.
+    """Everyone who will ever be on the list in this run: the starting list plus all arrivals.
 
     Generated up front from a seed that doesn't depend on the policy or the number of lists,
     so every scenario sees exactly the same patients (common random numbers).
+
+    The starting list is either a few weeks of arrivals with waits spread over the first 6 weeks
+    (settled start) or, if ``start_waiting`` is set, that many patients shared evenly between the
+    surgeons, with waits from ``starting_waits``.
     """
     r_arr, r_true, r_plan = (np.random.default_rng(s) for s in np.random.SeedSequence([seed, 99]).spawn(3))
     surgeons = sorted(world.true_params["surgeon"].unique(), key=lambda x: int(x[1:]))
     share = world.procedures.set_index("procedure")["referral_share"]
     rates = arrival_rates(world, cfg)
     total_days = 7 * (cfg.weeks_warmup + cfg.weeks_measured)
+    # A separate stream for today's list, so the arrivals are the same whatever list you start from.
+    r_start = np.random.default_rng(np.random.SeedSequence([seed, 98]))
+    if cfg.start_waiting is not None:
+        start_counts = r_start.multinomial(int(cfg.start_waiting), np.full(len(surgeons), 1 / len(surgeons)))
 
     rows = []
     for k, s in enumerate(surgeons):
         procs = world.true_params.loc[world.true_params.surgeon == s, "procedure"].to_numpy()
         w = share.loc[procs].to_numpy()
         w = w / w.sum()
-        n_init = r_arr.poisson(rates[k] * cfg.initial_backlog_weeks)
+        # (The order of random draws matches earlier versions, so settled runs reproduce published results.)
+        n_init = r_arr.poisson(rates[k] * cfg.initial_backlog_weeks) if cfg.start_waiting is None else start_counts[k]
         n_new = r_arr.poisson(rates[k] * total_days / 7)
-        days = np.concatenate([r_arr.uniform(-42, 0, n_init), r_arr.uniform(0, total_days, n_new)])
+        if cfg.start_waiting is None:
+            init_days = r_arr.uniform(-42, 0, n_init)
+        else:
+            init_days = -starting_waits(n_init, cfg.target_days, cfg.start_over_target_share,
+                                        cfg.start_longest_days, r_start)
+        days = np.concatenate([init_days, r_arr.uniform(0, total_days, n_new)])
         for d in np.floor(days).astype(int):
             rows.append((k, r_arr.choice(procs, p=w), d, r_arr.random() < cfg.urgent_share))
     df = pd.DataFrame(rows, columns=["surgeon_idx", "procedure", "added_day", "urgent"])
@@ -319,6 +364,7 @@ def simulate(world: World, cfg: RollingConfig, seed: int, pts: Patients | None =
         weekly.append({
             "week": week,
             "waiting": int(still.sum()),
+            "over_target": int(np.sum(w_now > cfg.target_days)),
             "waiting_within_6wk": float(np.mean(w_now <= cfg.target_days)) if still.any() else 1.0,
             "longest_wait_days": int(w_now.max()) if still.any() else 0,
             "treated": int(just_treated.sum()),
@@ -365,4 +411,56 @@ def summarise_run(out: dict, cfg: RollingConfig) -> dict:
         "waiting_list_mean": float(w["waiting"].mean()),
         "waiting_list_growth": float(w["waiting"].iloc[-1] - w["waiting"].iloc[0]),
         "longest_wait_days_end": float(w["longest_wait_days"].iloc[-1]),
+        **(recovery_measures(out, cfg) if cfg.start_waiting is not None else {}),
+    }
+
+
+SUSTAIN_WEEKS = 4
+
+
+def weeks_to_target(share_by_week: np.ndarray, threshold: float, sustain: int = SUSTAIN_WEEKS) -> float:
+    """Weeks from the start until the share within target first reaches ``threshold`` and stays
+    there for ``sustain`` weeks in a row. Week 0 is the first week, so meeting it at the end of
+    the first week counts as 1. NaN if it never does within the run."""
+    ok = np.asarray(share_by_week) >= threshold
+    for i in range(len(ok) - sustain + 1):
+        if ok[i:i + sustain].all():
+            return float(i + 1)
+    return np.nan
+
+
+def recovery_measures(out: dict, cfg: RollingConfig) -> dict:
+    """For a run that starts from today's waiting list: where it starts, when the target is met,
+    how fast the patients already over target are cleared, and where the list settles."""
+    w = out["weekly"]
+    p = out["patients"]
+    start = p[p.added_day < 0]
+    waited_now = -start.added_day
+    over_now = waited_now > cfg.target_days
+    n_weeks = len(w)
+    final = w.iloc[-min(13, n_weeks):]
+    final_start = 7 * (n_weeks - len(final))
+    t = p[p.treated_day >= final_start]
+    final_waits = t.treated_day - t.added_day
+    cleared = start.treated_day >= 0
+
+    def over_at(week: int) -> float:
+        return float(w.loc[w.week == week - 1, "over_target"].iloc[0]) if week <= n_weeks else np.nan
+
+    return {
+        "waiting_start": float(len(start)),
+        "over_target_start": float(over_now.sum()),
+        "longest_wait_days_start": float(waited_now.max()) if len(start) else 0.0,
+        "weeks_to_target": weeks_to_target(w["waiting_within_6wk"].to_numpy(), cfg.target_share),
+        "over_target_week_13": over_at(13),
+        "over_target_week_26": over_at(26),
+        "over_target_end": float(w["over_target"].iloc[-1]),
+        "waiting_end": float(w["waiting"].iloc[-1]),
+        # everyone on today's list treated by the end of this week (NaN if some are still waiting)
+        "weeks_to_treat_start_list": float(np.floor(start.treated_day.max() / 7) + 1)
+        if len(start) and cleared.all() else np.nan,
+        "share_start_list_treated": float(cleared.mean()) if len(start) else np.nan,
+        # the last 13 weeks: where the list settles
+        "waiting_within_6wk_final": float(final["waiting_within_6wk"].mean()),
+        "treated_within_6wk_final": float(np.mean(final_waits <= cfg.target_days)) if len(final_waits) else np.nan,
     }

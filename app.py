@@ -26,9 +26,11 @@ from theatre_sched.scenarios import (  # noqa: E402
     compare,
     compare_lists_needed,
     describe,
+    describe_start,
     headline,
     lists_needed,
     match_overrun,
+    recovery_curve,
     run,
     seed_for,
 )
@@ -45,6 +47,7 @@ SWEEP_FILE = ROOT / "results" / "history_sweep.csv"
 BLUE, ORANGE, AQUA, YELLOW = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
 NEUTRAL, MUTED, GRID, BAND = "#52514e", "#898781", "#e1e0d9", "#f0efea"
 GOOD, CRITICAL = "#0ca30c", "#d03b3b"
+START_NAMES = {"today": "Today's waiting list", "settled": "A settled list (steady state)"}
 SPECIALTY_NAMES = {"general_surgery": "General surgery", "orthopaedics": "Orthopaedics",
                    "gynaecology": "Gynaecology", "ent": "ENT"}
 POLICY_NAMES = {"in_turn": "In turn (urgent first, then longest wait)",
@@ -58,7 +61,8 @@ MODEL_NAMES = {"plugin": "Plug-in: each pair's own past cases",
 DEFAULTS = {"specialty": "general_surgery", "n_surgeons": 6, "lists_per_surgeon": 1, "session_minutes": 480,
             "working_weeks": 42, "referrals": 24, "extra_lists": 0.5, "turnaround": 15, "policy": "in_turn",
             "booking_rule": "average", "fill_pct": 100, "alpha_pct": 10, "duration_model": "plugin",
-            "overrun_tolerance": 30, "history_cases": 15}
+            "overrun_tolerance": 30, "history_cases": 15,
+            "start_mode": "today", "start_waiting": 200, "start_over_pct": 35, "start_longest": 30, "horizon": 52}
 B_START = {**DEFAULTS, "booking_rule": "monte_carlo"}
 FIELDS = list(DEFAULTS)
 
@@ -107,6 +111,19 @@ def cached_needed(scn: dict, seeds: int, threshold: float):
     return lists_needed(Scenario(**scn), seeds, threshold)
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
+def cached_recovery(scn: dict, seeds: int):
+    return recovery_curve(Scenario(**scn), seeds)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def settled_list(scn: dict) -> tuple[float, float]:
+    """Average list size and share still waiting within target once the same settings have settled."""
+    settled = Scenario(**{**scn, "start_waiting": None})
+    m = run(settled, 3).per_seed.mean(numeric_only=True)
+    return float(m["waiting_list_mean"]), float(m["waiting_within_6wk"])
+
+
 @st.cache_data(show_spinner=False, max_entries=64)
 def demand_share(specialty: str, n_surgeons: int, lists_per_surgeon: int, session_minutes: float,
                  working_weeks: int, referrals: float) -> float:
@@ -144,6 +161,10 @@ def scenario_from_state(p: str) -> Scenario:
         turnaround=float(g("turnaround")), policy=g("policy"), booking_rule=g("booking_rule"),
         fill_fraction=g("fill_pct") / 100, alpha=g("alpha_pct") / 100, duration_model=g("duration_model"),
         overrun_tolerance=float(g("overrun_tolerance")), target_weeks=int(st.session_state["target_weeks"]),
+        target_share=st.session_state["threshold_pct"] / 100,
+        start_waiting=int(g("start_waiting")) if g("start_mode") == "today" else None,
+        start_over_target_pct=float(g("start_over_pct")), start_longest_weeks=float(g("start_longest")),
+        horizon_weeks=int(g("horizon")),
     )
 
 
@@ -169,6 +190,22 @@ def controls(p: str, two_columns: bool = False) -> None:
                              st.session_state[k("working_weeks")], st.session_state[k("referrals")])
         st.caption(f"These need about **{100 * share:.0f}%** of the theatre time available after leave "
                    "(before any extra lists, at a 15-minute changeover).")
+    with left, st.expander("Starting waiting list", expanded=True):
+        st.radio("Start from", list(START_NAMES), format_func=START_NAMES.get, key=k("start_mode"), horizontal=True,
+                 help="Today's list: simulate forward from a list of the size and wait profile you set, measuring "
+                      "every week. Settled: start small and run a 26-week warm-up first, so the results show "
+                      "where these settings end up whatever the start.")
+        settled = st.session_state[k("start_mode")] == "settled"
+        tw_now = int(st.session_state["target_weeks"])
+        st.slider("Patients waiting now", 0, 2000, step=10, key=k("start_waiting"), disabled=settled,
+                  help="The whole specialty's list, shared evenly between the surgeons.")
+        st.slider(f"Already waited more than {tw_now} weeks (%)", 0, 90, key=k("start_over_pct"), disabled=settled)
+        if st.session_state[k("start_longest")] <= tw_now:
+            st.session_state[k("start_longest")] = tw_now + 1
+        st.slider("Longest wait now (weeks)", tw_now + 1, 104, key=k("start_longest"), disabled=settled,
+                  help="Waits beyond the target thin out evenly up to this.")
+        st.select_slider("Weeks to simulate from today", options=[26, 52, 78, 104], key=k("horizon"),
+                         disabled=settled)
     with right, st.expander("Booking", expanded=True):
         st.radio("How full lists are booked", list(RULE_NAMES), format_func=RULE_NAMES.get, key=k("booking_rule"))
         avg = st.session_state[k("booking_rule")] == "average"
@@ -286,6 +323,70 @@ def weekly_charts(res, target_weeks: int, threshold: float, warmup: int = 26):
             (rect + text + rule + rule_text + share).properties(height=250))
 
 
+def recovery_charts(res, target_weeks: int, threshold: float):
+    """For a run from today's list: the list split into within and over target, and the share within target,
+    starting at week 0 (today)."""
+    wk = res.weekly.groupby("week")[["waiting", "over_target", "waiting_within_6wk"]].mean().reset_index()
+    wk["week"] += 1
+    p = res.per_seed
+    now = pd.DataFrame({"week": [0], "waiting": [p["waiting_start"].mean()], "over_target": [p["over_target_start"].mean()],
+                        "waiting_within_6wk": [float(np.mean(1 - p["over_target_start"] / p["waiting_start"].clip(lower=1)))]})
+    wk = pd.concat([now, wk], ignore_index=True)
+    wk["within_n"] = wk["waiting"] - wk["over_target"]
+    wk["within"] = 100 * wk["waiting_within_6wk"]
+    x = alt.X("week:Q", title="Weeks from today", scale=alt.Scale(domain=[0, int(wk["week"].max())], nice=False))
+
+    within_lab, over_lab = f"Waited up to {target_weeks} weeks", f"Waited longer than {target_weeks} weeks"
+    long = pd.concat([wk.assign(group=within_lab, n=wk["within_n"], order=0),
+                      wk.assign(group=over_lab, n=wk["over_target"], order=1)])
+    area = alt.Chart(long).mark_area(opacity=0.9, line={"strokeWidth": 1.5}).encode(
+        x=x, y=alt.Y("n:Q", title="Patients waiting", stack=True),
+        color=alt.Color("group:N", scale=alt.Scale(domain=[within_lab, over_lab], range=[BLUE, ORANGE]),
+                        legend=alt.Legend(title=None, orient="top")),
+        order=alt.Order("order:Q"),
+        tooltip=[alt.Tooltip("week:Q", title="Week"), "group:N", alt.Tooltip("n:Q", title="Patients", format=".0f")])
+
+    lo = max(0.0, float(np.floor(min(100 * threshold - 10, wk["within"].min() - 2) / 10) * 10))
+    y_scale = alt.Scale(domain=[lo, 100])
+    share = alt.Chart(wk).mark_line(color=BLUE, strokeWidth=2, clip=True).encode(
+        x=x, y=alt.Y("within:Q", title=f"Within {target_weeks} weeks (%)", scale=y_scale),
+        tooltip=[alt.Tooltip("week:Q", title="Week"), alt.Tooltip("within:Q", title="Within target (%)", format=".1f")])
+    goal = pd.DataFrame({"y": [100 * threshold], "label": [f"Target {threshold:.0%}"]})
+    rule = alt.Chart(goal).mark_rule(color=NEUTRAL, strokeDash=[4, 4]).encode(y=alt.Y("y:Q", scale=y_scale))
+    rule_text = alt.Chart(goal).mark_text(align="right", dx=-4, dy=12, color=NEUTRAL, fontSize=11).encode(
+        x=alt.datum(int(wk["week"].max())), y=alt.Y("y:Q", scale=y_scale), text="label:N")
+    layers = rule + rule_text + share
+    met = p["weeks_to_target"]
+    if met.notna().all():
+        m = pd.DataFrame({"week": [met.mean()], "y": [lo], "label": [f"Met from week {met.mean():.0f}"]})
+        layers = (alt.Chart(m).mark_rule(color=GOOD, strokeWidth=1.5).encode(x="week:Q")
+                  + alt.Chart(m).mark_text(align="left", dx=5, baseline="bottom", dy=-4, color="#3a3936", fontSize=11)
+                  .encode(x="week:Q", y=alt.Y("y:Q", scale=y_scale), text="label:N") + layers)
+    return area.properties(height=260), layers.properties(height=260)
+
+
+def recovery_sweep_chart(curve: pd.DataFrame, deadline: int, horizon: int, seeds: int):
+    d = curve.copy()
+    d["all_runs"] = np.where(d["share_reaching"] >= 1, "Met in every run", "Not met in every run")
+    d["runs_text"] = (d["share_reaching"] * seeds).round().astype(int).astype(str) + f" of {seeds} runs"
+    d = d[d["weeks_to_target"].notna()]
+    pts = alt.Chart(d).mark_line(strokeWidth=2, color=BLUE, point=False).encode(
+        x=alt.X("extra_lists:Q", title="Extra lists per week"),
+        y=alt.Y("weeks_to_target:Q", title="Weeks until the target is met", scale=alt.Scale(domain=[0, horizon]))
+    ) + alt.Chart(d).mark_point(size=70, strokeWidth=2, color=BLUE).encode(
+        x="extra_lists:Q", y="weeks_to_target:Q",
+        fill=alt.Fill("all_runs:N", scale=alt.Scale(domain=["Met in every run", "Not met in every run"],
+                                                    range=[BLUE, "#ffffff"]), legend=alt.Legend(title=None, orient="top")),
+        tooltip=[alt.Tooltip("extra_lists:Q", title="Extra lists/week"),
+                 alt.Tooltip("weeks_to_target:Q", title="Weeks to target (runs meeting it)", format=".1f"),
+                 alt.Tooltip("runs_text:N", title="Met in")])
+    line = pd.DataFrame({"y": [deadline], "label": [f"By week {deadline}"]})
+    rule = alt.Chart(line).mark_rule(color=NEUTRAL, strokeDash=[4, 4]).encode(y="y:Q")
+    text = alt.Chart(line).mark_text(align="right", dy=-7, color=NEUTRAL, fontSize=11).encode(
+        x=alt.datum(float(curve["extra_lists"].max())), y="y:Q", text="label:N")
+    return (rule + text + pts).properties(height=280)
+
+
 def waits_chart(waits: np.ndarray, target_weeks: int):
     weeks = np.floor(waits / 7).astype(int)
     counts = pd.Series(weeks).value_counts().sort_index()
@@ -397,14 +498,16 @@ def sweep_chart(sweep: pd.DataFrame):
 
 # ---------------------------------------------------------------- page
 st.title("Theatre list booking simulator")
-st.markdown('<div class="lede">A year of elective theatre booking for one specialty, simulated week by week: '
-            'who gets booked, how full lists are, what happens on the day, and how long patients wait. '
-            '<span class="badge">Synthetic data</span></div>', unsafe_allow_html=True)
+st.markdown('<div class="lede">Elective theatre booking for one specialty, simulated week by week from today\'s '
+            'waiting list: who gets booked, how full lists are, what happens on the day, how long patients wait, '
+            'and when the waiting-time target is met. <span class="badge">Synthetic data</span></div>',
+            unsafe_allow_html=True)
 
 with st.sidebar:
     st.subheader("Simulation")
     st.slider("Runs (synthetic hospitals)", 3, 20, key="seeds",
-              help="More runs: smaller uncertainty, slower. Each run is 26 weeks' warm-up plus 52 measured weeks.")
+              help="More runs: smaller uncertainty, slower. Each run simulates the weeks from today, or a "
+                   "26-week warm-up plus 52 measured weeks for a settled list.")
     st.slider("Target: weeks from being added to surgery", 2, 18, key="target_weeks")
     st.slider("Target share treated within that time (%)", 80, 99, key="threshold_pct")
     st.subheader("Scenario A")
@@ -422,22 +525,74 @@ with tab_a:
         ra = cached_run(asdict(scn_a), seeds)
     m = ra.per_seed.mean(numeric_only=True)
     st.markdown(f'<div class="scenario-line"><b>{SPECIALTY_NAMES[scn_a.specialty]}</b> · {scn_a.n_surgeons} surgeons · '
-                f'{scn_a.referrals_per_week:.0f} referrals a week · {describe(scn_a)}. Means over {seeds} runs.</div>',
-                unsafe_allow_html=True)
+                f'{scn_a.referrals_per_week:.0f} referrals a week · {describe(scn_a)}. Starting from '
+                f'{describe_start(scn_a)}. Means over {seeds} runs.</div>', unsafe_allow_html=True)
 
-    eyebrow(f"Waiting times: the {tw}-week target, three ways")
-    cols = st.columns(3)
-    cards = [
-        ("Still waiting: within target", m["waiting_within_6wk"],
-         "Share of the list at each week's end who have waited no longer than the target. How the national RTT "
-         "standard is measured."),
-        ("Treated: had waited no longer than target", m["treated_within_6wk"],
-         "Of the patients operated on, the share who had waited no longer than the target."),
-        ("Added to the list: treated within target", m["cohort_within_6wk"],
-         "Of everyone added, the share operated on within the target. Treating patients out of turn can't flatter it."),
-    ]
-    for c, (label, value, text) in zip(cols, cards):
-        c.markdown(target_card(label, value, thr, text), unsafe_allow_html=True)
+    if scn_a.from_today:
+        p = ra.per_seed
+        H = scn_a.horizon_weeks
+        eyebrow(f"From today's list, over the next {H} weeks")
+        cols = st.columns(4)
+        met = p["weeks_to_target"]
+        if met.notna().all():
+            value, ok = f"Week {met.mean():.0f}", True
+            detail = (f"runs range from week {met.min():.0f} to {met.max():.0f}" if met.min() != met.max()
+                      else f"in every run")
+        else:
+            value, ok = "Not met", False
+            detail = f"met within {H} weeks in {int(met.notna().sum())} of {len(met)} runs"
+        icon, colour = ("✓", GOOD) if ok else ("✕", CRITICAL)
+        cols[0].markdown(
+            f'<div class="kpi"><div class="label">{thr:.0%} still waiting within {tw} weeks: first met</div>'
+            f'<div class="value">{value}</div><span class="status"><span class="icon" style="background:{colour}">'
+            f'{icon}</span>{"Met" if ok else "Not met"} within {H} weeks</span>'
+            f'<div class="note">The first week from which it holds for 4 weeks running; {detail}.</div></div>',
+            unsafe_allow_html=True)
+        cols[1].markdown(
+            f'<div class="kpi"><div class="label">Patients waiting longer than {tw} weeks</div>'
+            f'<div class="value">{m["over_target_start"]:,.0f} → {m["over_target_week_26"]:,.0f}</div>'
+            f'<div class="note">Today, then after 26 weeks. After 13 weeks: {m["over_target_week_13"]:,.0f}; '
+            f'at week {H}: {m["over_target_end"]:,.0f}.</div></div>', unsafe_allow_html=True)
+        settled_n, settled_within = settled_list(asdict(scn_a))
+        cols[2].markdown(
+            f'<div class="kpi"><div class="label">Patients waiting</div>'
+            f'<div class="value">{m["waiting_start"]:,.0f} → {m["waiting_end"]:,.0f}</div>'
+            f'<div class="note">Today, then at week {H}. Once settled, these settings hold about '
+            f'{settled_n:,.0f} on the list.</div></div>', unsafe_allow_html=True)
+        cleared = p["weeks_to_treat_start_list"]
+        if cleared.notna().all():
+            cv, cn = f"Week {cleared.mean():.0f}", "Everyone on today's list has been operated on by then."
+        else:
+            cv, cn = f"{100 * m['share_start_list_treated']:.0f}%", f"of today's list operated on by week {H}."
+        cols[3].markdown(f'<div class="kpi"><div class="label">Today\'s list: all treated by</div>'
+                         f'<div class="value">{cv}</div><div class="note">{cn}</div></div>', unsafe_allow_html=True)
+
+        eyebrow(f"Where it ends up: the last 13 weeks")
+        cols = st.columns(3)
+        cards = [
+            ("Still waiting: within target", m["waiting_within_6wk_final"],
+             "Share of the list at each week's end who have waited no longer than the target (the national measure)."),
+            ("Treated: had waited no longer than target", m["treated_within_6wk_final"],
+             "Of the patients operated on in the last 13 weeks, the share who had waited no longer than the target."),
+            ("Added during the run: treated within target", m["cohort_within_6wk"],
+             "Of the new patients added in the run (not today's list), the share operated on within the target."),
+        ]
+        for c, (label, value, text) in zip(cols, cards):
+            c.markdown(target_card(label, value, thr, text), unsafe_allow_html=True)
+    else:
+        eyebrow(f"Waiting times: the {tw}-week target, three ways")
+        cols = st.columns(3)
+        cards = [
+            ("Still waiting: within target", m["waiting_within_6wk"],
+             "Share of the list at each week's end who have waited no longer than the target. How the national RTT "
+             "standard is measured."),
+            ("Treated: had waited no longer than target", m["treated_within_6wk"],
+             "Of the patients operated on, the share who had waited no longer than the target."),
+            ("Added to the list: treated within target", m["cohort_within_6wk"],
+             "Of everyone added, the share operated on within the target. Treating patients out of turn can't flatter it."),
+        ]
+        for c, (label, value, text) in zip(cols, cards):
+            c.markdown(target_card(label, value, thr, text), unsafe_allow_html=True)
 
     eyebrow("Theatre use")
     c = st.columns(5)
@@ -452,10 +607,15 @@ with tab_a:
 
     st.write("")
     left, right = st.columns(2, gap="large")
-    size_chart, share_chart = weekly_charts(ra, tw, thr)
+    if scn_a.from_today:
+        size_chart, share_chart = recovery_charts(ra, tw, thr)
+        size_note = "Patients waiting at the end of each week, split by how long they've waited. Week 0 is today."
+    else:
+        size_chart, share_chart = weekly_charts(ra, tw, thr)
+        size_note = "Patients waiting at the end of each week, averaged over runs."
     with left:
         st.subheader("Waiting list")
-        note("Patients waiting at the end of each week, averaged over runs.")
+        note(size_note)
         st.altair_chart(size_chart, width="stretch")
     with right:
         st.subheader("Still waiting within target, by week")
@@ -464,22 +624,44 @@ with tab_a:
     left, right = st.columns(2, gap="large")
     with left:
         st.subheader("How long treated patients waited")
-        note("Patients operated on in the 52 measured weeks.")
+        note(f"Patients operated on in the {scn_a.horizon_weeks if scn_a.from_today else 52} measured weeks"
+             + (", including today's list." if scn_a.from_today else "."))
         st.altair_chart(waits_chart(ra.waits, tw), width="stretch")
     with right:
-        st.subheader("Extra lists needed")
-        if st.toggle("Work out extra lists needed (about 5–10 seconds)", key="show_needed_a"):
-            with st.spinner("Sweeping extra lists…"):
-                na = cached_needed(asdict(scn_a), seeds, thr)
-            note(f"Each measure against extra lists a week; the dashed line is the {thr:.0%} target.")
-            st.altair_chart(needed_chart(na.curve, thr), width="stretch")
-            rows = [{"Measure": MEASURE_LABELS[k], "Per week": fmt(v, 2, ""),
-                     "Per year": fmt(52 * v, 0, "")} for k, v in na.needed.items()]
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-            st.caption(f"Extra lists on top of the surgeons' own weekly lists (this sweep ignores the "
-                       f"'Extra lists per week' setting). A dash means not reached within {na.max_extra:g} a week.")
+        if scn_a.from_today:
+            st.subheader("Recovering faster with extra lists")
+            if st.toggle("Work out the effect of extra lists (a few seconds)", key="show_needed_a"):
+                with st.spinner("Sweeping extra lists…"):
+                    rec = cached_recovery(asdict(scn_a), seeds)
+                deadline = st.slider("Meet the target by week", 4, scn_a.horizon_weeks,
+                                     value=min(26, scn_a.horizon_weeks), step=1, key="deadline_a")
+                need = rec.lists_to_meet_by(deadline)
+                note(f"Weeks until {thr:.0%} of the list is within {tw} weeks, against extra lists a week "
+                     "(hollow points: not met in every run).")
+                st.altair_chart(recovery_sweep_chart(rec.curve, deadline, scn_a.horizon_weeks, seeds), width="stretch")
+                if np.isfinite(need):
+                    st.markdown(f"To meet the target by **week {deadline}**: about **{need:.2f} extra lists a week** "
+                                f"on top of the surgeons' own lists, or {need * deadline:.0f} lists in all by then.")
+                else:
+                    st.markdown(f"Not every run meets the target by week {deadline}, even with "
+                                f"{rec.curve['extra_lists'].max():g} extra lists a week.")
+                st.caption("This sweep replaces the 'Extra lists per week' setting with each value in turn.")
+            else:
+                note("Sweeps 0 to 3 extra lists a week and shows how soon the target is met with each.")
         else:
-            note("Sweeps 0 to 3 extra lists a week and finds where each measure reaches the target share.")
+            st.subheader("Extra lists needed")
+            if st.toggle("Work out extra lists needed (about 5–10 seconds)", key="show_needed_a"):
+                with st.spinner("Sweeping extra lists…"):
+                    na = cached_needed(asdict(scn_a), seeds, thr)
+                note(f"Each measure against extra lists a week; the dashed line is the {thr:.0%} target.")
+                st.altair_chart(needed_chart(na.curve, thr), width="stretch")
+                rows = [{"Measure": MEASURE_LABELS[k], "Per week": fmt(v, 2, ""),
+                         "Per year": fmt(52 * v, 0, "")} for k, v in na.needed.items()]
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+                st.caption(f"Extra lists on top of the surgeons' own weekly lists (this sweep ignores the "
+                           f"'Extra lists per week' setting). A dash means not reached within {na.max_extra:g} a week.")
+            else:
+                note("Sweeps 0 to 3 extra lists a week and finds where each measure reaches the target share.")
 
 with tab_cmp:
     st.markdown("Scenario B starts from the settings below. Change what you want to test. Both scenarios run on "
@@ -496,51 +678,86 @@ with tab_cmp:
     with st.expander("Scenario B settings", expanded=True):
         controls("B", two_columns=True)
     scn_b = scenario_from_state("B")
-    with st.spinner("Simulating both scenarios…"):
-        ra = cached_run(asdict(scn_a), seeds)
-        rb = cached_run(asdict(scn_b), seeds)
-    cmp = compare(ra, rb)
-    with_lists = st.toggle("Include extra lists needed for both (about 10–20 seconds)", key="show_needed_ab")
-    lists_cmp, na, nb = None, None, None
-    if with_lists:
-        with st.spinner("Sweeping extra lists for both scenarios…"):
-            na = cached_needed(asdict(scn_a), seeds, thr)
-            nb = cached_needed(asdict(scn_b), seeds, thr)
-        lists_cmp = compare_lists_needed(na, nb)
-    st.markdown(
-        f'<div class="callout"><div class="eyebrow" style="margin-top:0">In short</div>'
-        f'{headline(cmp, lists_cmp, tw, thr, scn_b.session_minutes, 3.0)}'
-        f'<div class="chart-note" style="margin:0.5rem 0 0">A: {SPECIALTY_NAMES[scn_a.specialty]}, {describe(scn_a)}.<br>'
-        f'B: {SPECIALTY_NAMES[scn_b.specialty]}, {describe(scn_b)}.</div></div>', unsafe_allow_html=True)
+    if scn_a.from_today != scn_b.from_today:
+        st.warning("A and B start from different places (one from today's list, one from a settled list), so they "
+                   "can't be compared run by run. Set both to the same starting point under Starting waiting list.")
+    else:
+        with st.spinner("Simulating both scenarios…"):
+            ra = cached_run(asdict(scn_a), seeds)
+            rb = cached_run(asdict(scn_b), seeds)
+        cmp = compare(ra, rb)
+        today = scn_a.from_today
+        with_lists = st.toggle("Include the effect of extra lists for both (a few seconds)" if today else
+                               "Include extra lists needed for both (about 10–20 seconds)", key="show_needed_ab")
+        lists_cmp, na, nb, rec_a, rec_b = None, None, None, None, None
+        if with_lists and today:
+            with st.spinner("Sweeping extra lists for both scenarios…"):
+                rec_a = cached_recovery(asdict(scn_a), seeds)
+                rec_b = cached_recovery(asdict(scn_b), seeds)
+        elif with_lists:
+            with st.spinner("Sweeping extra lists for both scenarios…"):
+                na = cached_needed(asdict(scn_a), seeds, thr)
+                nb = cached_needed(asdict(scn_b), seeds, thr)
+            lists_cmp = compare_lists_needed(na, nb)
+        starts = (f"Both start from {describe_start(scn_a)}." if today and describe_start(scn_a) == describe_start(scn_b)
+                  else (f"A starts from {describe_start(scn_a)}; B from {describe_start(scn_b)}." if today else ""))
+        st.markdown(
+            f'<div class="callout"><div class="eyebrow" style="margin-top:0">In short</div>'
+            f'{headline(cmp, lists_cmp, tw, thr, scn_b.session_minutes, 3.0)}'
+            f'<div class="chart-note" style="margin:0.5rem 0 0">A: {SPECIALTY_NAMES[scn_a.specialty]}, {describe(scn_a)}.<br>'
+            f'B: {SPECIALTY_NAMES[scn_b.specialty]}, {describe(scn_b)}.' + (f"<br>{starts}" if starts else "")
+            + '</div></div>', unsafe_allow_html=True)
 
-    st.subheader("Differences")
-    table = pd.DataFrame({
-        "Measure": cmp["measure"],
-        "A": [fmt(v, d, u) for v, d, u in zip(cmp["A"], cmp["decimals"], cmp["unit"])],
-        "B": [fmt(v, d, u) for v, d, u in zip(cmp["B"], cmp["decimals"], cmp["unit"])],
-        "B − A": [signed(v, d, " pts" if u == "%" else "")
-                  for v, d, u in zip(cmp["difference"], cmp["decimals"], cmp["unit"])],
-        "± (2 standard errors)": [fmt(v, d, "") for v, d in zip(cmp["plus_minus"], cmp["decimals"])],
-        "Clear difference?": ["Yes" if np.isfinite(pm) and abs(d) > pm else "No"
-                              for d, pm in zip(cmp["difference"], cmp["plus_minus"])],
-    })
-    if lists_cmp is not None:
-        extra = pd.DataFrame({
-            "Measure": [f"Extra lists a year to reach {thr:.0%}: " + s.split(":")[0].lower() for s in lists_cmp["measure"]],
-            "A": [fmt(v, 0, "") for v in lists_cmp["A"]],
-            "B": [fmt(v, 0, "") for v in lists_cmp["B"]],
-            "B − A": [signed(v, 0) for v in lists_cmp["difference"]],
-            "± (2 standard errors)": [fmt(v, 0, "") for v in lists_cmp["plus_minus"]],
+        st.subheader("Differences")
+        table = pd.DataFrame({
+            "Measure": cmp["measure"],
+            "A": [fmt(v, d, u) for v, d, u in zip(cmp["A"], cmp["decimals"], cmp["unit"])],
+            "B": [fmt(v, d, u) for v, d, u in zip(cmp["B"], cmp["decimals"], cmp["unit"])],
+            "B − A": [signed(v, d, " pts" if u == "%" else "")
+                      for v, d, u in zip(cmp["difference"], cmp["decimals"], cmp["unit"])],
+            "± (2 standard errors)": [fmt(v, d, "") for v, d in zip(cmp["plus_minus"], cmp["decimals"])],
             "Clear difference?": ["Yes" if np.isfinite(pm) and abs(d) > pm else ("–" if not np.isfinite(d) else "No")
-                                  for d, pm in zip(lists_cmp["difference"], lists_cmp["plus_minus"])],
+                                  for d, pm in zip(cmp["difference"], cmp["plus_minus"])],
         })
-        table = pd.concat([table, extra], ignore_index=True)
-    st.dataframe(table, hide_index=True, height=38 + 35 * len(table), width="stretch")
-    st.caption(f"Means over {seeds} runs. Differences are paired run by run; '±' is two standard errors of the "
-               "paired difference, so a difference smaller than it isn't distinguishable from noise.")
-    if na is not None:
-        st.subheader("Extra lists needed: A and B")
-        st.altair_chart(ab_needed_chart(na.curve, nb.curve, thr, tw), width="stretch")
+        if lists_cmp is not None:
+            extra = pd.DataFrame({
+                "Measure": [f"Extra lists a year to reach {thr:.0%}: " + s.split(":")[0].lower() for s in lists_cmp["measure"]],
+                "A": [fmt(v, 0, "") for v in lists_cmp["A"]],
+                "B": [fmt(v, 0, "") for v in lists_cmp["B"]],
+                "B − A": [signed(v, 0) for v in lists_cmp["difference"]],
+                "± (2 standard errors)": [fmt(v, 0, "") for v in lists_cmp["plus_minus"]],
+                "Clear difference?": ["Yes" if np.isfinite(pm) and abs(d) > pm else ("–" if not np.isfinite(d) else "No")
+                                      for d, pm in zip(lists_cmp["difference"], lists_cmp["plus_minus"])],
+            })
+            table = pd.concat([table, extra], ignore_index=True)
+        st.dataframe(table, hide_index=True, height=38 + 35 * len(table), width="stretch")
+        st.caption(f"Means over {seeds} runs. Differences are paired run by run; '±' is two standard errors of the "
+                   "paired difference, so a difference smaller than it isn't distinguishable from noise. A dash means "
+                   "the measure isn't defined in every run (for example, the target is never met).")
+        if na is not None:
+            st.subheader("Extra lists needed: A and B")
+            st.altair_chart(ab_needed_chart(na.curve, nb.curve, thr, tw), width="stretch")
+        if rec_a is not None:
+            st.subheader("Recovering faster with extra lists: A and B")
+            H = min(scn_a.horizon_weeks, scn_b.horizon_weeks)
+            deadline = st.slider("Meet the target by week", 4, H, value=min(26, H), key="deadline_ab")
+            need_a, need_b = rec_a.lists_to_meet_by(deadline), rec_b.lists_to_meet_by(deadline)
+            say = lambda v: f"{v:.2f} extra lists a week" if np.isfinite(v) else "more than 3 extra lists a week"  # noqa: E731
+            st.markdown(f"To meet the target by week {deadline}, A needs about **{say(need_a)}** and B about "
+                        f"**{say(need_b)}**.")
+            both = pd.concat([rec_a.curve.assign(scenario="A"), rec_b.curve.assign(scenario="B")])
+            both = both[both["weeks_to_target"].notna()]
+            chart = alt.Chart(both).mark_line(point=alt.OverlayMarkDef(size=45), strokeWidth=2).encode(
+                x=alt.X("extra_lists:Q", title="Extra lists per week"),
+                y=alt.Y("weeks_to_target:Q", title="Weeks until the target is met", scale=alt.Scale(domain=[0, H])),
+                color=alt.Color("scenario:N", scale=alt.Scale(domain=["A", "B"], range=[BLUE, ORANGE]),
+                                legend=alt.Legend(title=None, orient="top")),
+                tooltip=["scenario:N", alt.Tooltip("extra_lists:Q", title="Extra lists/week"),
+                         alt.Tooltip("weeks_to_target:Q", title="Weeks to target", format=".1f"),
+                         alt.Tooltip("share_reaching:Q", title="Share of runs meeting it", format=".0%")])
+            rule = alt.Chart(pd.DataFrame({"y": [deadline]})).mark_rule(color=NEUTRAL, strokeDash=[4, 4]).encode(y="y:Q")
+            st.altair_chart((rule + chart).properties(height=300), width="stretch")
+            note("Each point is the mean over the runs that meet the target; hover for the share of runs that do.")
 
 with tab_dur:
     st.markdown(

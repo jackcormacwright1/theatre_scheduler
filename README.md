@@ -204,11 +204,12 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
   - specialty, number of surgeons, lists per surgeon and list length;
   - operating weeks a year and extra lists per week;
   - demand, as referrals a week for the whole specialty, shared between the surgeons, so adding surgeons adds capacity rather than demand;
+  - where to start: **today's waiting list** (its size, the share already past the target and the longest wait, and how many weeks to simulate) or a settled list after a warm-up, as in Part 2;
   - how full lists are booked (to average times at a chosen fill %, or to a Monte Carlo overrun limit), and the Monte Carlo planner's duration model;
   - booking order and how much history the planner has;
   - changeover time and the on-the-day cancellation rule;
   - the target (weeks, and share of patients).
-- **Scenario A tab.** The three waiting-time measures, each marked as meeting or missing the target, then utilisation, overruns and cancellations. It also charts the waiting list over time and how long treated patients waited, and can sweep extra lists to show how many each measure needs to reach the target.
+- **Scenario A tab.** From today's list: the week the target is first met, patients over target today and after 26 weeks, the list today and at the end (against the size it settles at), when everyone on today's list has been treated, and where the three measures end up over the last 13 weeks. The waiting list chart splits patients into within and over target week by week. An optional sweep shows how soon the target is met with 0 to 3 extra lists a week, and the extra lists needed to meet it by a chosen week. For a settled list, the three waiting-time measures are marked as meeting or missing the target. It also charts the waiting list over time and how long treated patients waited, and can sweep extra lists to show how many each measure needs to reach the target.
 - **Compare A and B tab.** B starts as a copy of A, and you change whatever you're testing. Both run on the same synthetic hospitals and, where the demand settings match, the same patients. The tab reports the paired difference B − A with ± two standard errors and flags whether each difference is clear of the noise. It covers:
   - patients treated a year, all three 6-week measures, median and 95th-percentile waits, and waiting list size;
   - lists, session minutes, patient-in-theatre minutes and overtime minutes a year, and session minutes per patient treated;
@@ -222,6 +223,12 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
 - **Duration model tab.** Shows partial pooling at work in one synthetic hospital: for a chosen procedure, each surgeon's own average, the hierarchical estimate and the true time, and how the weight on a pair's own data grows with its number of past cases. It also charts the history sweep above.
 
 ![The duration model tab](docs/dashboard_duration.png)
+
+### Starting from today's waiting list
+
+Part 2 deliberately forgets where the list starts: a 26-week warm-up lets it settle, so the results describe where the settings lead. A service with a backlog needs the other question: given the list we have now, what happens from here? The dashboard can start from a list of a given size and wait profile and measure every week from today ([methodology, section 6.8](docs/METHODOLOGY.md)).
+
+This brings out something the settled view hides. Booking in turn clears the longest waiters first, so new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages, and 200 patients waiting today, 35% of them over 6 weeks), everyone on today's list is treated by about week 11, but 95% within 6 weeks isn't held until about week 27 (week 18 to 39 across five runs). One extra list a week instead of half brings that forward by 15 weeks (± 8), to about week 11. Meeting the target by week 26 needs about 0.45 extra lists a week, and by week 13 about 0.9.
 
 In the year-long simulation, the better duration model mainly shows up as fewer overruns and on-the-day cancellations rather than shorter waits. In general surgery at 24 referrals a week and a 10% limit, lists overran 3.1% of the time against 3.9% with the plug-in model (10 runs; 4.8% against 5.8% with 3 past cases per pair). The differences in waiting times were within the noise, because at that demand the waits are set by capacity rather than by how cautiously lists are booked.
 
@@ -263,7 +270,7 @@ To deploy it on Streamlit Community Cloud:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                                   # 34 tests
+pytest                                   # 38 tests
 python scripts/run_experiment.py         # Part 1: about a minute; writes results/
 python scripts/run_experiment.py --history-cases 200 --out results/history200
 python scripts/run_history_sweep.py      # Part 1 with 3, 15, 50 and 200 past cases per pair: about 4 minutes
