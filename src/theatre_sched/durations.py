@@ -249,3 +249,162 @@ def fit_hierarchical(history: pd.DataFrame, surgeon_effect: bool = True, n_iter:
     Xc = design(combos["surgeon"], combos["procedure"])
     extra = dict(zip(map(tuple, combos.to_numpy()), np.einsum("ij,jk,ik->i", Xc, cov, Xc)))
     return HierarchicalModel(table, alpha, beta, float(np.sqrt(tau2)), sigma_by_proc, extra, surgeon_effect)
+
+
+# --------------------------------------------------------------------------------------------
+# Bayesian model on a grid: the hierarchical model with its spreads uncertain too
+# --------------------------------------------------------------------------------------------
+
+def _design(surgeon: np.ndarray, procedure: np.ndarray, procs: list[str], surgeons: list[str],
+            surgeon_effect: bool) -> np.ndarray:
+    """Columns: one per procedure (alpha_p); then, with ``surgeon_effect``, one per surgeon but the last,
+    in sum-to-zero coding (the last surgeon's effect is minus the sum of the others)."""
+    X = (np.asarray(procedure)[:, None] == np.array(procs)[None, :]).astype(float)
+    if surgeon_effect and len(surgeons) > 1:
+        S = (np.asarray(surgeon)[:, None] == np.array(surgeons)[None, :]).astype(float)
+        X = np.hstack([X, S[:, :-1] - S[:, [-1]]])
+    return X
+
+
+def tau_log_posterior(tau_grid: np.ndarray, X: np.ndarray, ybar: np.ndarray, samp_var: np.ndarray) -> np.ndarray:
+    """log p(tau | pair averages, sigma) on a grid, up to a constant, with a flat prior on tau and on the
+    regression coefficients (Gelman et al., Bayesian Data Analysis, section 5.4).
+
+    Each pair average is ybar_i ~ Normal(x_i' gamma, tau^2 + v_i), v_i = sigma_p^2 / n_i. Integrating out
+    gamma leaves, for each tau, with w_i = 1 / (tau^2 + v_i) and gamma_hat the weighted least-squares fit:
+
+        log p(tau | ...) = -1/2 log det(X' W X) - 1/2 sum log(tau^2 + v_i) - 1/2 sum w_i (ybar_i - x_i' gamma_hat)^2
+    """
+    W = 1.0 / (tau_grid[:, None] ** 2 + samp_var[None, :])  # (G, N)
+    XtWX = np.einsum("gn,ni,nj->gij", W, X, X)
+    XtWy = np.einsum("gn,ni,n->gi", W, X, ybar)
+    gamma = np.linalg.solve(XtWX, XtWy[..., None])[..., 0]
+    resid = ybar[None, :] - gamma @ X.T
+    _, logdet = np.linalg.slogdet(XtWX)
+    return -0.5 * logdet + 0.5 * np.log(W).sum(axis=1) - 0.5 * np.sum(W * resid ** 2, axis=1)
+
+
+class BayesModel:
+    """The hierarchical model, but with tau and each sigma_p uncertain instead of fixed at estimates.
+
+    Fitted by drawing ``n_draws`` sets of parameters from their joint posterior, without MCMC:
+
+    1. sigma_p^2 for each procedure, from its within-pair spread: with a prior p(sigma^2) ~ 1/sigma^2,
+       sigma_p^2 | data ~ S_p / chi^2(nu_p), where nu_p = sum of (n - 1) over the procedure's pairs and
+       S_p the sum of squared deviations of each case from its pair's average. (This uses only the spread
+       within pairs, and ignores the little the pair averages say about sigma.)
+    2. tau, from its posterior on a grid given those sigmas (``tau_log_posterior``), with a uniform prior
+       on 0 to ``tau_max``: pick a grid cell with its probability, then a point uniformly within the cell.
+    3. the regression coefficients gamma (procedure averages and surgeon speeds) given tau and sigma:
+       Normal(gamma_hat, (X' W X)^-1).
+    4. each pair's average theta_i given the rest: Normal(w ybar_i + (1 - w) x_i' gamma, w v_i), with
+       w = tau^2 / (tau^2 + v_i). A pair with no history gets Normal(x' gamma, tau^2).
+
+    ``sample`` then uses one parameter set per Monte Carlo draw, shared by all patients of a pair, so
+    the planner's draws carry the uncertainty about sigma and tau as well as about each pair.
+    """
+
+    def __init__(self, procs, surgeons, surgeon_effect, pairs, X_pairs, sigma2, tau, gamma, theta,
+                 tau_grid, tau_post):
+        self.procs, self.surgeons, self.surgeon_effect = procs, surgeons, surgeon_effect
+        self.pairs = pairs  # DataFrame of observed pairs: surgeon, procedure, n, ybar
+        self._pair_index = {k: i for i, k in enumerate(zip(pairs["surgeon"], pairs["procedure"]))}
+        self._proc_index = {p: i for i, p in enumerate(procs)}
+        self.sigma2 = sigma2  # (K, n_procs)
+        self.tau = tau  # (K,)
+        self.gamma = gamma  # (K, n_coef)
+        self.theta = theta  # (K, n_pairs)
+        self.tau_grid, self.tau_post = tau_grid, tau_post  # marginal posterior of tau on the grid
+
+    @property
+    def n_draws(self) -> int:
+        return len(self.tau)
+
+    def _theta_for(self, patients: pd.DataFrame, cols: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+        """theta and sigma for each patient (rows) and draw (columns ``cols`` of the parameter bank)."""
+        keys = list(zip(patients["surgeon"], patients["procedure"]))
+        codes, uniques = pd.factorize(pd.Index(keys))
+        theta_u = np.empty((len(uniques), len(cols)))
+        for u, (s, p) in enumerate(uniques):
+            if p not in self._proc_index:
+                raise KeyError(f"no history at all for procedure {p!r}")
+            i = self._pair_index.get((s, p))
+            if i is not None:
+                theta_u[u] = self.theta[cols, i]
+            else:  # a pair with no history: the prior for its surgeon and procedure
+                x = _design(np.array([s]), np.array([p]), self.procs, self.surgeons, self.surgeon_effect)[0]
+                theta_u[u] = self.gamma[cols] @ x + self.tau[cols] * rng.standard_normal(len(cols))
+        proc_idx = np.array([self._proc_index[p] for p in patients["procedure"]])
+        sigma = np.sqrt(self.sigma2[cols][:, proc_idx]).T
+        return theta_u[codes], sigma
+
+    def sample(self, patients: pd.DataFrame, n_samples: int, rng: np.random.Generator) -> np.ndarray:
+        """Shape (n_patients, n_samples): each column uses one parameter set from the posterior."""
+        cols = rng.permutation(self.n_draws)[:n_samples] if n_samples <= self.n_draws \
+            else rng.integers(0, self.n_draws, n_samples)
+        theta, sigma = self._theta_for(patients, cols, rng)
+        return np.exp(theta + sigma * rng.standard_normal(theta.shape))
+
+    def mean_minutes(self, patients: pd.DataFrame) -> np.ndarray:
+        cols = np.arange(self.n_draws)
+        theta, sigma = self._theta_for(patients, cols, np.random.default_rng(0))
+        return np.exp(theta + 0.5 * sigma ** 2).mean(axis=1)
+
+    def interval(self, q: float = 0.90) -> pd.DataFrame:
+        """Posterior median and central ``q`` interval of each observed pair's average (log scale)."""
+        a = (1 - q) / 2
+        out = self.pairs[["surgeon", "procedure", "n"]].copy()
+        out["median"] = np.median(self.theta, axis=0)
+        out["low"] = np.quantile(self.theta, a, axis=0)
+        out["high"] = np.quantile(self.theta, 1 - a, axis=0)
+        return out
+
+
+def fit_bayes(history: pd.DataFrame, surgeon_effect: bool = True, n_draws: int = 1000, tau_max: float = 1.0,
+              n_grid: int = 200, seed: int = 0) -> BayesModel:
+    """Fit ``BayesModel`` (see its docstring): ``n_draws`` joint posterior draws, computed exactly
+    apart from the grid spacing and the step-1 simplification."""
+    rng = np.random.default_rng(seed)
+    h = history.assign(y=np.log(history["minutes"]))
+    g = h.groupby(["surgeon", "procedure"])["y"]
+    pairs = g.agg(n="size", ybar="mean").reset_index()
+    pairs["ss"] = g.apply(lambda x: float(np.sum((x - x.mean()) ** 2))).to_numpy()
+    procs = sorted(pairs["procedure"].unique())
+    surgeons = sorted(pairs["surgeon"].unique(), key=lambda s: (len(s), s))
+    X = _design(pairs["surgeon"].to_numpy(), pairs["procedure"].to_numpy(), procs, surgeons, surgeon_effect)
+    ybar, n = pairs["ybar"].to_numpy(), pairs["n"].to_numpy()
+    proc_idx = pairs["procedure"].map({p: i for i, p in enumerate(procs)}).to_numpy()
+
+    # 1. sigma_p^2 ~ S_p / chi^2(nu_p); procedures with no pair of 2+ cases borrow the overall spread
+    nu = np.bincount(proc_idx, weights=n - 1, minlength=len(procs))
+    S = np.bincount(proc_idx, weights=pairs["ss"].to_numpy(), minlength=len(procs))
+    nu_all, S_all = nu.sum(), S.sum()
+    nu_use = np.where(nu > 0, nu, max(nu_all, 1.0))
+    S_use = np.where(nu > 0, S, S_all if nu_all > 0 else 0.09)
+    sigma2 = S_use[None, :] / rng.chisquare(nu_use[None, :], (n_draws, len(procs)))
+
+    # 2-4. tau, gamma, theta, one draw at a time (each needs its own grid posterior)
+    step = tau_max / n_grid
+    grid = (np.arange(n_grid) + 0.5) * step
+    tau = np.empty(n_draws)
+    gamma = np.empty((n_draws, X.shape[1]))
+    theta = np.empty((n_draws, len(pairs)))
+    post_sum = np.zeros(n_grid)
+    for j in range(n_draws):
+        v = sigma2[j, proc_idx] / n
+        lp = tau_log_posterior(grid, X, ybar, v)
+        p = np.exp(lp - lp.max())
+        p /= p.sum()
+        post_sum += p
+        t = grid[rng.choice(n_grid, p=p)] + (rng.random() - 0.5) * step
+        tau[j] = t
+        w_inv = 1.0 / (t ** 2 + v)
+        prec = (X.T * w_inv) @ X
+        cov = np.linalg.inv(prec)
+        g_hat = cov @ ((X.T * w_inv) @ ybar)
+        gamma[j] = rng.multivariate_normal(g_hat, cov)
+        m = X @ gamma[j]
+        w = t ** 2 / (t ** 2 + v)
+        theta[j] = w * ybar + (1 - w) * m + np.sqrt(w * v) * rng.standard_normal(len(pairs))
+    return BayesModel(procs, surgeons, surgeon_effect, pairs[["surgeon", "procedure", "n", "ybar"]],
+                      X, sigma2, tau, gamma, theta, grid, post_sum / n_draws)

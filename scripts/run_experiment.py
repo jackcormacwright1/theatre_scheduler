@@ -33,6 +33,7 @@ import pandas as pd
 
 from theatre_sched import (
     LognormalPairModel,
+    fit_bayes,
     fit_hierarchical,
     WorldConfig,
     add_weights,
@@ -52,17 +53,19 @@ LABELS = {
     "avg-ratio": "Book to average (ratio order)",
     "cc-plugin": "Chance-constrained (plug-in model)",
     "cc-hier": "Chance-constrained (hierarchical model)",
+    "cc-bayes": "Chance-constrained (Bayesian model, grid)",
     "cc-oracle": "Chance-constrained (true durations)",
 }
 
 # Colours: reference categorical palette, slots 1-4; the oracle is a neutral reference line.
 COLOURS = {"avg-queue": "#2a78d6", "avg-ratio": "#eb6834", "cc-plugin": "#1baf7a", "cc-hier": "#eda100",
-           "cc-oracle": "#52514e"}
-MARKERS = {"avg-queue": "o", "avg-ratio": "s", "cc-plugin": "D", "cc-hier": "v", "cc-oracle": "^"}
+           "cc-bayes": "#e87ba4", "cc-oracle": "#52514e"}
+MARKERS = {"avg-queue": "o", "avg-ratio": "s", "cc-plugin": "D", "cc-hier": "v", "cc-bayes": "P", "cc-oracle": "^"}
 INK, MUTED, GRID, AXIS, SURFACE = "#0b0b0b", "#898781", "#e1e0d9", "#c3c2b7", "#fcfcfb"
 
 
-def run_world(seed: int, cfg_in: WorldConfig, lam: float, n_plan: int, n_eval: int) -> tuple[list[dict], list[dict]]:
+def run_world(seed: int, cfg_in: WorldConfig, lam: float, n_plan: int, n_eval: int,
+              bayes: bool = False) -> tuple[list[dict], list[dict]]:
     w = make_world(cfg_in, seed=seed)
     cfg = w.config
     p = add_weights(w.patients, lam=lam)
@@ -71,6 +74,7 @@ def run_world(seed: int, cfg_in: WorldConfig, lam: float, n_plan: int, n_eval: i
 
     plan = fit.model.sample(p, n_plan, np.random.default_rng([seed, 1]))
     hier = fit_hierarchical(w.history).sample(p, n_plan, np.random.default_rng([seed, 4]))
+    bayes_draws = fit_bayes(w.history, seed=seed).sample(p, n_plan, np.random.default_rng([seed, 5])) if bayes else None
     oracle = truth.sample(p, n_plan, np.random.default_rng([seed, 2]))
     reality = truth.sample(p, n_eval, np.random.default_rng([seed, 3]))
     hist_mean = fit.historical_mean(p)
@@ -82,6 +86,9 @@ def run_world(seed: int, cfg_in: WorldConfig, lam: float, n_plan: int, n_eval: i
     for a in ALPHAS:
         jobs.append(("cc-plugin", a, lambda a=a: chance_constrained(p, w.sessions, plan, cfg.turnaround_minutes, a)))
         jobs.append(("cc-hier", a, lambda a=a: chance_constrained(p, w.sessions, hier, cfg.turnaround_minutes, a)))
+        if bayes:
+            jobs.append(("cc-bayes", a,
+                         lambda a=a: chance_constrained(p, w.sessions, bayes_draws, cfg.turnaround_minutes, a)))
         jobs.append(("cc-oracle", a, lambda a=a: chance_constrained(p, w.sessions, oracle, cfg.turnaround_minutes, a)))
 
     rows, list_rows = [], []

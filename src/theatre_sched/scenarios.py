@@ -58,7 +58,7 @@ class Scenario:
     booking_rule: str = "average"
     fill_fraction: float = 1.0
     alpha: float = 0.10
-    duration_model: str = "plugin"  # for the Monte Carlo rule: "plugin", "hierarchical" or "oracle"
+    duration_model: str = "plugin"  # for the Monte Carlo rule: "plugin", "hierarchical", "bayes" or "oracle"
     overrun_tolerance: float = 30.0
     target_weeks: int = 6
     urgent_share: float = 0.10
@@ -380,7 +380,8 @@ def describe(scn: Scenario) -> str:
     if scn.booking_rule == "average":
         how = f"to average case times, lists filled to {round(100 * scn.fill_fraction)}%"
     else:
-        model = {"plugin": "plug-in", "hierarchical": "hierarchical", "oracle": "true"}[scn.duration_model]
+        model = {"plugin": "plug-in", "hierarchical": "hierarchical", "bayes": "Bayesian",
+                 "oracle": "true"}[scn.duration_model]
         how = f"to a {round(100 * scn.alpha)}% Monte Carlo overrun limit ({model} duration model)"
     lists = ", pooling waiting lists within subspecialty" if scn.pooling == "pooled" else ""
     return f"booking {order}, {how}{lists}"

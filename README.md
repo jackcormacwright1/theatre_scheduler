@@ -1,5 +1,7 @@
 # Theatre list booking under uncertain case durations
 
+[![tests](https://github.com/jackcormacwright1/theatre_scheduler/actions/workflows/tests.yml/badge.svg)](https://github.com/jackcormacwright1/theatre_scheduler/actions/workflows/tests.yml)
+
 Booking elective theatre lists means choosing which patients from a waiting list go on each surgeon's sessions. Case times are uncertain and skewed (most cases come in near the usual time, a few take much longer), so lists booked to average times often overrun, which means overtime or patients cancelled on the day.
 
 The project has three parts:
@@ -14,6 +16,15 @@ The project has three parts:
 
 **Full methodology**, covering every formula, assumption and check with worked examples: [docs/METHODOLOGY.md](docs/METHODOLOGY.md). The same page is the *Methodology* tab in the dashboard.
 
+## Headline findings
+
+- **The duration model, not the optimiser, limits a Monte Carlo planner.** With realistic amounts of history, a planner told to keep each list under a 10% chance of overrunning lets its riskiest tenth of lists overrun 16% of the time (45% with only 3 past cases per surgeon and procedure). Partial pooling brings that to 13% (25%), and a Bayesian model that also carries the uncertainty in its own spreads, fitted on a grid without MCMC and checked against PyMC, to 12% (15%). A planner that knew the true durations would manage 9.6%.
+- **At the same overrun rate, Monte Carlo booking treats no more patients than first come, first served on averages.** Its value is in setting the trade-off between overruns, cancellations and waiting deliberately.
+- **How the 6-week target is measured changes the capacity needed.** The national-style measure (patients still waiting) says each specialty needs 13–26 fewer extra lists a year than counting new patients treated within 6 weeks, and it can reward holding patients back.
+- **From today's waiting list, the backlog clears before the target is met**, and where it sits matters. A backlog concentrated on one surgeon meets the target at about week 25 rather than 17; pooling waiting lists within subspecialty brings that to about week 12.
+
+![The dashboard](docs/dashboard_scenario.png)
+
 # Part 1: one booking window
 
 ## Findings
@@ -24,9 +35,10 @@ These come from 20 synthetic worlds, each with 5 surgeons, 300 patients and four
 2. **Modelling each case's uncertainty adds little on top, and only with good duration estimates.** With the true durations, the chance-constrained planner books about 4 more patients than a flat buffer at a 5% overrun rate, falling to under 1 at 30%. With durations estimated from the history (a median of 15 past cases per surgeon–procedure pair), it books slightly *fewer* (0.4–1.5) than the flat buffer.
 3. **With realistic amounts of history, the planner misses its own target.** It is told to keep every list at or below a 5% chance of overrunning. On average it does (4.7%), but the riskiest tenth of its lists overrun about 10% of the time or more. At a 10% target, they overrun 16% or more. Its risk is spread no more evenly than a flat buffer's.
 4. **The shortfall comes from small samples, not from the search.** Give the planner 200 past cases per pair and it matches the true-durations planner (riskiest tenth of lists at 5.4% against 4.8%, for a 5% target).
-5. **A hierarchical duration model closes about half the gap.** Estimating each surgeon–procedure time partly from the rest of the data (the procedure's typical time and the surgeon's speed on other procedures), and carrying the remaining uncertainty into the Monte Carlo draws, brings the riskiest tenth of lists from 16.3% to 13.0% at a 10% target (the true durations give 9.6%). At the same overrun rate it books 1.3 more patients than booking to average (± 0.8), where the plug-in planner books 0.6 fewer. It matters most when history is thin: with a typical 3 past cases per pair, the plug-in planner's riskiest lists overrun 45% of the time against a 10% target, and the hierarchical planner's 25%. With 200 cases the three planners converge.
+5. **A hierarchical duration model closes about half the gap.** Estimating each surgeon–procedure time partly from the rest of the data (the procedure's typical time and the surgeon's speed on other procedures), and carrying the remaining uncertainty into the Monte Carlo draws, brings the riskiest tenth of lists from 16.3% to 13.0% at a 10% target (the true durations give 9.6%). At the same overrun rate it books 1.3 more patients than booking to average (± 0.8), where the plug-in planner books 0.6 fewer. It matters most when history is thin: with a typical 3 past cases per pair, the plug-in planner's riskiest lists overrun 45% of the time against a 10% target, and the hierarchical planner's 25%. With 200 cases the planners converge.
+6. **A Bayesian version closes most of what is left when history is thin.** The hierarchical model estimates how far pairs differ (τ) and how much single cases vary (σ) once, and treats those estimates as exact, so its 90% intervals for each pair contain the truth only 80% of the time with 3 past cases. The Bayesian model keeps the same structure but averages over the uncertainty in τ and σ too: σ from a standard formula, τ from its posterior worked out on a grid of 200 values, and everything else exactly, with no MCMC. Its intervals hold at 88–90% at every amount of history, and with 3 past cases per pair its riskiest tenth of lists overrun 15% of the time against the hierarchical planner's 25% (12.3% against 13.0% with 15). Fitting the same model with PyMC's MCMC sampler gives the same posterior, twenty times more slowly; written in the "centred" form, the sampler fails in the way the textbooks warn about (section 3.3 of the [methodology](docs/METHODOLOGY.md)).
 
-So the duration model, not the optimiser, is what limits the planner, and partial pooling is a cheap improvement.
+So the duration model, not the optimiser, is what limits the planner, and partial pooling, with the spreads' uncertainty carried through, is a cheap improvement.
 
 ![Patients booked against overrun rate](results/frontier.png)
 
@@ -46,14 +58,14 @@ At roughly a 7% overrun rate (means over 20 worlds; full table in [`results/summ
 
 [`scripts/run_history_sweep.py`](scripts/run_history_sweep.py) reruns the comparison with a typical 3, 15, 50 and 200 past cases per surgeon–procedure pair, holding everything else fixed, at a 10% overrun limit (20 worlds each; full table in [`results/history_sweep.md`](results/history_sweep.md)):
 
-| Past cases per pair | Riskiest 10% of lists: plug-in | hierarchical | true durations | Extra patients vs booking to average: plug-in | hierarchical |
-|---|---|---|---|---|---|
-| 3 | 45.3% | 24.9% | 9.6% | −2.4 ± 1.4 | +1.7 ± 1.6 |
-| 15 | 16.3% | 13.0% | 9.6% | −0.6 ± 0.6 | +1.3 ± 0.8 |
-| 50 | 12.2% | 11.2% | 9.6% | −0.3 ± 0.8 | +0.4 ± 0.9 |
-| 200 | 10.9% | 10.3% | 9.6% | 0.0 ± 0.4 | +0.4 ± 0.5 |
+| Past cases per pair | Riskiest 10% of lists: plug-in | hierarchical | Bayesian | true durations | Extra patients vs booking to average: plug-in | hierarchical | Bayesian |
+|---|---|---|---|---|---|---|---|
+| 3 | 45.3% | 24.9% | 15.2% | 9.6% | −2.4 ± 1.4 | +1.7 ± 1.6 | +1.9 ± 1.9 |
+| 15 | 16.3% | 13.0% | 12.3% | 9.6% | −0.6 ± 0.6 | +1.3 ± 0.8 | +1.6 ± 0.9 |
+| 50 | 12.2% | 11.2% | 10.9% | 9.6% | −0.3 ± 0.8 | +0.4 ± 0.9 | +0.3 ± 0.8 |
+| 200 | 10.9% | 10.3% | 10.1% | 9.6% | 0.0 ± 0.4 | +0.4 ± 0.5 | +0.3 ± 0.4 |
 
-Extra patients are at the same overrun rate as booking to average in ratio order, ± two standard errors across worlds.
+Extra patients are at the same overrun rate as booking to average in ratio order, ± two standard errors across worlds. With 3 past cases, the Bayesian planner books so cautiously that in 4 of the 20 worlds its overrun rate falls below anything booking to average reaches, so its extra patients there come from the other 16.
 
 ![History sweep](results/history_sweep.png)
 
@@ -80,6 +92,7 @@ The 1 rewards booking anyone at all, and the urgency term rewards booking people
 
 - **Plug-in.** Estimate μ and σ for each surgeon–procedure pair from its own history, then treat the estimates as exact. Pairs with fewer than 3 cases borrow the procedure's pooled σ. This is what a planner could realistically do.
 - **Hierarchical.** Each pair's estimate is a weighted average of its own average and a prior (the procedure's typical time, adjusted for the surgeon's speed on their other procedures), with weight n / (n + k) on its own n cases. k, the number of cases at which the two get equal weight, is estimated from how much pairs differ beyond what the prior explains. The remaining uncertainty in each pair's average is drawn once per Monte Carlo draw and shared by all that pair's patients, so a surgeon who is slower than the data suggest is slower on every case. Fitted by empirical Bayes (method of moments), with no MCMC. [Methodology, section 3.1](docs/METHODOLOGY.md) has the formulas and a worked example.
+- **Bayesian (grid).** The hierarchical model with τ and each σ uncertain too. σ² is drawn as S / χ², τ from its posterior on a grid of 200 values (with the procedure and surgeon averages integrated out exactly), then the averages and each pair's typical time from their normal distributions: 1,000 joint posterior draws in about a second, one per Monte Carlo draw when planning. [Methodology, sections 3.2 and 3.3](docs/METHODOLOGY.md) cover the grid, worked examples, the interval check and the PyMC comparison.
 - **Truth.** The world's real parameters, used to score schedules and as an oracle planner.
 
 ### Booking methods
@@ -112,7 +125,7 @@ Comparisons "at the same overrun rate" interpolate the book-to-average curve wit
 
 ## Next steps for Part 1
 
-1. **A fully Bayesian duration model.** The hierarchical model's intervals for pair averages are a little too narrow with sparse data (90% intervals contain the truth 80% of the time with 3 past cases per pair), because the fit treats the spreads σ and τ as known. MCMC would carry that uncertainty too, which may close more of the remaining calibration gap.
+1. **A richer Bayesian duration model.** The grid model handles one uncertain spread. Grouping surgeons within subspecialties, each group with its own spread, or allowing heavier-tailed case times, needs MCMC; [`scripts/check_pymc.py`](scripts/check_pymc.py) is the starting point.
 2. **Exact benchmark.** Solve the same sampled problem as an integer programme to measure how far the heuristic is from optimal.
 3. **Case order within a list.** Test whether putting the more predictable cases first reduces overtime.
 
@@ -156,7 +169,7 @@ The results come from 10 synthetic worlds per specialty. Each has 6 surgeons ope
 
 2. **The national-style measure also struggles to tell booking policies apart, and can reward holding patients back.** With no extra lists, booking patients just before they would pass 6 weeks and filling the rest with long cases (`touch_fill`) raises the national-style measure by 3–5 points over booking in turn. Yet the share of new patients treated within 6 weeks is no better (0–3 points worse), and the median patient waits 3–6 days longer. Filling gaps with short cases instead (`ratio_fill`) keeps the national-style measure within about a point of booking in turn, but treats 5–10 points fewer new patients within 6 weeks. The reason is that a patient who is still within target counts in the measure's favour for as long as they wait.
 
-3. **85% touch-time utilisation is out of reach here, and adding lists pushes it further away.** At the capacity that meets the cohort target, average touch-time utilisation is 53–62%. Between a quarter and over a third of lists (25–37%) run short of patients, because each list can only be filled from its own surgeon's waiting list. Even full lists reach only 63–68% with 15-minute changeovers, or about 80% with 5-minute changeovers and a 30% overrun limit. The absolute levels depend on this model's assumptions, so the finding is the direction: more lists means emptier lists.
+3. **85% touch-time utilisation is out of reach here, and adding lists pushes it further away.** At the capacity that meets the cohort target, average touch-time utilisation is 53–62%. Between a quarter and over a third of lists (25–37%) run short of patients, because each list can only be filled from its own surgeon's waiting list (the dashboard can pool lists within subspecialty). Even full lists reach only 63–68% with 15-minute changeovers, or about 80% with 5-minute changeovers and a 30% overrun limit. The absolute levels depend on this model's assumptions, so the finding is the direction: more lists means emptier lists.
 
 4. **Faster changeovers and more willingness to overrun can stand in for extra lists.** With 5-minute changeovers and a 30% overrun limit, every specialty meets the cohort target with 0.25 extra lists a week, instead of 0.75–1.75. The cost is that 8.5–13% of lists overrun (against 3.5–4%) and 1.6–3.6 patients per 100 booked are cancelled on the day (against 0.6–1.2).
 
@@ -275,10 +288,12 @@ To deploy it on Streamlit Community Cloud:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                                   # 45 tests
+pytest                                   # 50 tests
 python scripts/run_experiment.py         # Part 1: about a minute; writes results/
 python scripts/run_experiment.py --history-cases 200 --out results/history200
-python scripts/run_history_sweep.py      # Part 1 with 3, 15, 50 and 200 past cases per pair: about 4 minutes
+python scripts/run_history_sweep.py      # Part 1 with 3, 15, 50 and 200 past cases per pair: about 30 minutes
+python scripts/run_coverage.py           # are the duration models' intervals honest? about 3 minutes
+python scripts/check_pymc.py --centred   # the Bayesian model by MCMC against the grid (needs pip install pymc)
 python scripts/run_capacity.py           # Part 2: about 1.5 minutes on 2 cores; writes results/capacity/
 python scripts/run_differentials.py      # Part 3: about 1.5 minutes on 2 cores; writes results/differentials/
 streamlit run app.py                     # Part 3: the dashboard (needs pip install -e ".[app]")
@@ -289,7 +304,7 @@ streamlit run app.py                     # Part 3: the dashboard (needs pip inst
 ```
 src/theatre_sched/
   synthetic.py    synthetic worlds: procedures for four specialties, surgeons, history, waiting list, sessions
-  durations.py    lognormal duration models: plug-in fit, hierarchical (partial pooling) fit, true parameters
+  durations.py    lognormal duration models: plug-in, hierarchical (partial pooling), Bayesian on a grid, true parameters
   evaluate.py     Monte Carlo scoring of lists and schedules, including touch-time utilisation
   schedule.py     Part 1: weights, book-to-average baselines, chance-constrained search
   rolling.py      Part 2: week-by-week simulation, booking rules and policies, the three 6-week measures
@@ -300,6 +315,8 @@ requirements.txt            dependencies for Streamlit Community Cloud
 .streamlit/config.toml      the dashboard's theme
 scripts/run_experiment.py   Part 1 comparison across synthetic worlds, tables and figures
 scripts/run_history_sweep.py  Part 1 planners against the amount of history per surgeon-procedure pair
+scripts/run_coverage.py     interval coverage of the hierarchical and Bayesian duration models
+scripts/check_pymc.py       the Bayesian duration model by MCMC (PyMC), checked against the grid
 scripts/run_capacity.py     Part 2 capacity scenarios by specialty, tables and figures
 scripts/run_differentials.py  Part 3 first-come-first-served vs optimised booking, by specialty
 docs/METHODOLOGY.md         full methodology (also the dashboard's Methodology tab)

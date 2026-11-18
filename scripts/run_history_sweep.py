@@ -2,7 +2,8 @@
 
 Reruns the Part 1 comparison with a typical (median) 3, 15, 50 and 200 past cases per
 surgeon-procedure pair, holding everything else in each world fixed, and reports for the
-chance-constrained planners (plug-in, hierarchical, true durations) at a 10% overrun limit:
+chance-constrained planners (plug-in, hierarchical, Bayesian on a grid, true durations) at a 10%
+overrun limit:
 
   * the realised overrun probability of the average list and of the riskiest 10% of lists;
   * extra patients booked compared with booking to average (ratio order) at the same overrun rate.
@@ -33,7 +34,7 @@ from theatre_sched import WorldConfig  # noqa: E402
 
 HISTORY = [3, 15, 50, 200]
 ALPHA = 0.10
-METHODS = ["cc-plugin", "cc-hier", "cc-oracle"]
+METHODS = ["cc-plugin", "cc-hier", "cc-bayes", "cc-oracle"]
 
 
 def main() -> None:
@@ -47,7 +48,7 @@ def main() -> None:
         cfg = WorldConfig(history_median_cases=hist)
         runs, lists = [], []
         for seed in range(args.worlds):
-            r, lr = run_world(seed, cfg, 1.0, 2000, 20000)
+            r, lr = run_world(seed, cfg, 1.0, 2000, 20000, bayes=True)
             runs += r
             lists += lr
         runs, lists = pd.DataFrame(runs), pd.DataFrame(lists)

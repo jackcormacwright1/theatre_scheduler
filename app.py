@@ -17,7 +17,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
-from theatre_sched.durations import fit_hierarchical  # noqa: E402
+from theatre_sched.durations import fit_bayes, fit_hierarchical  # noqa: E402
 from theatre_sched.rolling import POLICIES, RollingConfig, implied_load  # noqa: E402
 from theatre_sched.scenarios import (  # noqa: E402
     MEASURE_LABELS,
@@ -28,7 +28,6 @@ from theatre_sched.scenarios import (  # noqa: E402
     describe,
     describe_start,
     headline,
-    start_summary,
     lists_needed,
     match_overrun,
     recovery_curve,
@@ -62,6 +61,7 @@ RULE_NAMES = {"average": "To average case times, up to a fill %",
               "monte_carlo": "To a Monte Carlo overrun limit"}
 MODEL_NAMES = {"plugin": "Plug-in: each pair's own past cases",
                "hierarchical": "Hierarchical: partial pooling",
+               "bayes": "Bayesian: partial pooling, spreads uncertain too",
                "oracle": "True durations (reference only)"}
 DEFAULTS = {"specialty": "general_surgery", "n_surgeons": 6, "lists_per_surgeon": 1, "session_minutes": 480,
             "working_weeks": 42, "referrals": 24, "extra_lists": 0.5, "turnaround": 15, "policy": "in_turn",
@@ -140,6 +140,33 @@ def demand_share(specialty: str, n_surgeons: int, lists_per_surgeon: int, sessio
     cfg = RollingConfig(lists_per_surgeon=lists_per_surgeon, session_minutes=session_minutes,
                         working_weeks=working_weeks, referrals_per_week=referrals)
     return implied_load(world, cfg)
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def tau_posterior(specialty: str, n_surgeons: int, history: float) -> dict:
+    """The grid Bayesian model's posterior for tau in the same synthetic hospital as ``duration_estimates``."""
+    world = make_world(WorldConfig(specialty=specialty, n_surgeons=n_surgeons, history_median_cases=history,
+                                   subspecialties=True), seed=seed_for(specialty, 0))
+    b = fit_bayes(world.history, n_draws=1000, seed=0)
+    step = float(b.tau_grid[1] - b.tau_grid[0])
+    return {"grid": pd.DataFrame({"tau": b.tau_grid, "density": b.tau_post / step}),
+            "q": np.quantile(b.tau, [0.05, 0.5, 0.95]), "pairs": len(b.pairs), "cases": int(b.pairs["n"].sum()),
+            "eb_tau": fit_hierarchical(world.history).tau}
+
+
+def tau_chart(post: dict, true_tau: float = 0.08):
+    d = post["grid"][post["grid"]["tau"] <= max(0.4, float(post["q"][2]) * 1.3)]
+    area = alt.Chart(d).mark_area(color=PINK, opacity=0.35, line={"color": PINK, "strokeWidth": 2}).encode(
+        x=alt.X("tau:Q", title="τ: how far pairs differ from their procedure and surgeon averages (log scale)"),
+        y=alt.Y("density:Q", title="Posterior density"),
+        tooltip=[alt.Tooltip("tau:Q", format=".3f"), alt.Tooltip("density:Q", format=".1f")])
+    marks = pd.DataFrame({"tau": [post["eb_tau"], true_tau],
+                          "label": [f"Hierarchical estimate {post['eb_tau']:.3f}", f"True value {true_tau}"],
+                          "dy": [-8, 8]})
+    rule = alt.Chart(marks).mark_rule(strokeDash=[5, 4], strokeWidth=1.5).encode(
+        x="tau:Q", color=alt.Color("label:N", scale=alt.Scale(range=[YELLOW, NEUTRAL]),
+                                   legend=alt.Legend(title=None, orient="top")))
+    return (area + rule).properties(height=260)
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -612,7 +639,11 @@ def weight_chart(t: pd.DataFrame, k: float):
     return (line + pts + mark + lab).properties(height=300)
 
 
-SWEEP_NAMES = {"cc-plugin": "Plug-in", "cc-hier": "Hierarchical", "cc-oracle": "True durations"}
+SWEEP_NAMES = {"cc-plugin": "Plug-in", "cc-hier": "Hierarchical", "cc-bayes": "Bayesian (grid)",
+               "cc-oracle": "True durations"}
+PINK = "#e87ba4"
+COVERAGE_FILE = ROOT / "results" / "coverage.csv"
+PYMC_IMAGE = ROOT / "results" / "pymc_tau.png"
 
 
 def sweep_chart(sweep: pd.DataFrame):
@@ -621,7 +652,7 @@ def sweep_chart(sweep: pd.DataFrame):
     enc = dict(
         x=alt.X("history_cases:O", title="Typical past cases per surgeon and procedure", axis=alt.Axis(labelAngle=0)),
         y=alt.Y("risk:Q", title="Realised P(overrun), riskiest 10% of lists (%)"),
-        color=alt.Color("model:N", scale=alt.Scale(domain=order, range=[AQUA, YELLOW, NEUTRAL]),
+        color=alt.Color("model:N", scale=alt.Scale(domain=order, range=[AQUA, YELLOW, PINK, NEUTRAL][:len(order)]),
                         legend=alt.Legend(title=None, orient="top", symbolType="circle")),
         tooltip=["model:N", alt.Tooltip("history_cases:O", title="Past cases"),
                  alt.Tooltip("risk:Q", title="Riskiest 10% of lists (%)", format=".1f")])
@@ -676,7 +707,7 @@ with tab_a:
         if met.notna().all():
             value, ok = f"Week {met.mean():.0f}", True
             detail = (f"runs range from week {met.min():.0f} to {met.max():.0f}" if met.min() != met.max()
-                      else f"in every run")
+                      else "in every run")
         else:
             value, ok = "Not met", False
             detail = f"met within {H} weeks in {int(met.notna().sum())} of {len(met)} runs"
@@ -706,7 +737,7 @@ with tab_a:
         cols[3].markdown(f'<div class="kpi"><div class="label">Today\'s list: all treated by</div>'
                          f'<div class="value">{cv}</div><div class="note">{cn}</div></div>', unsafe_allow_html=True)
 
-        eyebrow(f"Where it ends up: the last 13 weeks")
+        eyebrow("Where it ends up: the last 13 weeks")
         cols = st.columns(3)
         cards = [
             ("Still waiting: within target", m["waiting_within_6wk_final"],
@@ -934,6 +965,38 @@ with tab_dur:
     st.caption(f"In this synthetic hospital, the typical error in a pair's estimated time is {100 * own_err:.0f}% from "
                f"its own cases alone and {100 * hier_err:.0f}% from the hierarchical model (root mean square, log scale).")
 
+    st.subheader("When τ itself is uncertain: the Bayesian model")
+    post = tau_posterior(spec, 6, float(hist))
+    lo, med, hi = post["q"]
+    left, right = st.columns([1.15, 1], gap="large")
+    with left:
+        st.altair_chart(tau_chart(post), width="stretch")
+        note(f"This hospital: {post['cases']:,} past cases in {post['pairs']} surgeon–procedure pairs. The posterior "
+             f"has its median at {med:.3f} and a 90% interval from {lo:.3f} to {hi:.3f}.")
+    with right:
+        st.markdown(
+            "The hierarchical model estimates τ once and then treats that estimate as exact, as it does each "
+            "procedure's spread σ. With few past cases, both are uncertain, so its intervals for each pair are too "
+            "narrow. The **Bayesian** model keeps the same structure but averages over every plausible τ and σ. "
+            "Without MCMC: σ is drawn from a standard formula, τ from its posterior worked out on a grid of 200 values "
+            "(the curve on the left), and everything else follows exactly. Choose it as the planner's duration model "
+            "under Booking in the sidebar.")
+        if COVERAGE_FILE.exists():
+            cov = pd.read_csv(COVERAGE_FILE)
+            ct = (cov.groupby(["history_cases", "model"])["covered"].mean().unstack() * 100).round(1)
+            ct = ct.rename(columns={"Hierarchical (empirical Bayes)": "Hierarchical", "Bayesian (grid)": "Bayesian"})
+            ct = ct[[c for c in ("Hierarchical", "Bayesian") if c in ct.columns]]
+            ct = ct.reset_index().rename(columns={"history_cases": "Typical past cases"})
+            st.caption("90% intervals for each pair's typical time that contain the true value (%), 30 synthetic "
+                       "hospitals per row (scripts/run_coverage.py)")
+            st.dataframe(ct, hide_index=True, width="stretch")
+    if PYMC_IMAGE.exists():
+        with st.expander("Checked against MCMC (PyMC)"):
+            st.image(str(PYMC_IMAGE), width="stretch")
+            st.caption("The same model fitted by MCMC with PyMC (scripts/check_pymc.py) gives the same posterior for τ "
+                       "as the grid. Written in the 'centred' form, the sampler struggles when τ is small (190 "
+                       "divergent transitions and a biased posterior near zero); in the 'non-centred' form it doesn't.")
+
     st.subheader("Does it help the planner hit its limit?")
     if SWEEP_FILE.exists():
         sweep = pd.read_csv(SWEEP_FILE)
@@ -944,19 +1007,28 @@ with tab_dur:
             st.altair_chart(sweep_chart(sweep), width="stretch")
         with right:
             tbl = sweep.assign(model=sweep["method"].map(SWEEP_NAMES)).pivot(
-                index="history_cases", columns="model", values="p90_list_risk")[list(SWEEP_NAMES.values())]
+                index="history_cases", columns="model", values="p90_list_risk")
+            tbl = tbl[[c for c in SWEEP_NAMES.values() if c in tbl.columns]]
             tbl = (100 * tbl).map(lambda v: f"{v:.1f}%").reset_index().rename(columns={"history_cases": "Past cases"})
             st.caption("Riskiest 10% of lists: realised chance of overrunning, against a 10% limit")
             st.dataframe(tbl, hide_index=True, width="stretch")
             h15 = sweep[sweep.history_cases == 15].set_index("method")
+            h3 = sweep[sweep.history_cases == 3].set_index("method")
             st.markdown(
                 f"With a typical 15 past cases per pair, the plug-in planner's riskiest tenth of lists overrun "
                 f"{100 * h15.at['cc-plugin', 'p90_list_risk']:.0f}% of the time against a 10% limit. The hierarchical "
-                f"planner brings that to {100 * h15.at['cc-hier', 'p90_list_risk']:.0f}%, and a planner that knew "
+                f"planner brings that to {100 * h15.at['cc-hier', 'p90_list_risk']:.0f}%"
+                + (f" and the Bayesian planner to {100 * h15.at['cc-bayes', 'p90_list_risk']:.0f}%"
+                   if "cc-bayes" in h15.index else "")
+                + f", and a planner that knew "
                 f"the true durations would manage {100 * h15.at['cc-oracle', 'p90_list_risk']:.0f}%. Compared with "
                 f"booking to average at the same overrun rate, the plug-in planner books "
                 f"{more_fewer(h15.at['cc-plugin', 'extra_vs_avg_ratio'])} patients in four weeks and the hierarchical "
-                f"one {more_fewer(h15.at['cc-hier', 'extra_vs_avg_ratio'])}.")
+                f"one {more_fewer(h15.at['cc-hier', 'extra_vs_avg_ratio'])}."
+                + (f" The Bayesian model matters most when history is thin: with a typical 3 past cases per pair, the "
+                   f"riskiest tenth of lists overrun {100 * h3.at['cc-plugin', 'p90_list_risk']:.0f}% of the time with the "
+                   f"plug-in planner, {100 * h3.at['cc-hier', 'p90_list_risk']:.0f}% with the hierarchical and "
+                   f"{100 * h3.at['cc-bayes', 'p90_list_risk']:.0f}% with the Bayesian." if "cc-bayes" in h3.index else ""))
             st.caption("Try it in the year-long simulation: choose the Monte Carlo booking rule and a duration model "
                        "under Booking in the sidebar.")
     else:

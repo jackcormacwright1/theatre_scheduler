@@ -113,3 +113,63 @@ def test_rolling_planner_choice_keeps_the_same_patients():
     b = make_patients(w, RollingConfig(duration_model="hierarchical", weeks_measured=10, plan_samples=50), seed=2)
     assert np.array_equal(a.true_minutes, b.true_minutes) and np.array_equal(a.added_day, b.added_day)
     assert not np.allclose(a.plan, b.plan)
+
+
+# ---------------------------------------------------------------- the grid Bayesian model
+from theatre_sched import fit_bayes  # noqa: E402
+from theatre_sched.durations import tau_log_posterior  # noqa: E402
+
+
+def test_tau_posterior_on_the_grid_finds_the_true_spread():
+    # 400 pair averages with a known spread of 0.1 around a common mean, each measured with variance 0.01
+    rng = np.random.default_rng(10)
+    v = np.full(400, 0.01)
+    ybar = 4.0 + rng.normal(0, 0.1, 400) + rng.normal(0, np.sqrt(v))
+    grid = np.linspace(0.005, 0.5, 100)
+    lp = tau_log_posterior(grid, np.ones((400, 1)), ybar, v)
+    assert grid[np.argmax(lp)] == pytest.approx(0.1, abs=0.02)
+
+
+def test_bayes_agrees_with_the_hierarchical_model_when_data_are_plentiful():
+    w = make_world(WorldConfig(history_median_cases=200), seed=3)
+    b = fit_bayes(w.history, n_draws=400, seed=3).interval(0.9).set_index(["surgeon", "procedure"])
+    h = fit_hierarchical(w.history).table.set_index(["surgeon", "procedure"])
+    assert np.allclose(b["median"], h.loc[b.index, "mu_hat"], atol=0.02)
+
+
+def test_bayes_intervals_are_wider_than_empirical_bayes_when_data_are_sparse():
+    widths = []
+    for seed in range(4):
+        w = make_world(WorldConfig(history_median_cases=3), seed=seed)
+        b = fit_bayes(w.history, n_draws=400, seed=seed).interval(0.9)
+        h = fit_hierarchical(w.history).table
+        widths.append(((b["high"] - b["low"]).mean(), (2 * 1.6449 * np.sqrt(h["post_var"])).mean()))
+    bayes, eb = np.mean(widths, axis=0)
+    assert bayes > eb  # tau and sigma are uncertain too
+
+
+def test_bayes_draws_share_each_pair_and_handle_unseen_pairs():
+    rng = np.random.default_rng(11)
+    hist = _history([("A", "x", np.log(60), 0.3, 2), ("B", "x", np.log(60), 0.3, 200),
+                     ("A", "y", np.log(30), 0.3, 200), ("B", "y", np.log(30), 0.3, 200),
+                     ("C", "y", np.log(35), 0.3, 50)], rng)
+    model = fit_bayes(hist, n_draws=2000, seed=1)
+    patients = pd.DataFrame({"surgeon": ["A", "A", "B", "C"], "procedure": ["x", "x", "y", "x"]})
+    s = np.log(model.sample(patients, 2000, np.random.default_rng(12)))
+    assert s.shape == (4, 2000) and np.isfinite(s).all()
+    assert np.corrcoef(s[0], s[1])[0, 1] > 0.05  # same pair: shared uncertainty
+    assert np.isfinite(model.mean_minutes(patients)).all()  # C has never done x
+    # sigma draws for procedure x: S / chi^2(nu) has mean S / (nu - 2), with nu = (2 - 1) + (200 - 1)
+    y = np.log(hist.loc[hist.procedure == "x", "minutes"])
+    S = float(sum(((g - g.mean()) ** 2).sum() for _, g in y.groupby(hist.loc[hist.procedure == "x", "surgeon"])))
+    assert model.sigma2[:, model.procs.index("x")].mean() == pytest.approx(S / 198, rel=0.03)
+    with pytest.raises(KeyError):
+        model.sample(pd.DataFrame({"surgeon": ["A"], "procedure": ["z"]}), 10, rng)
+
+
+def test_rolling_simulation_runs_with_the_bayesian_planner():
+    w = make_world(WorldConfig(n_surgeons=4), seed=2)
+    a = make_patients(w, RollingConfig(duration_model="plugin", weeks_measured=10, plan_samples=50), seed=2)
+    b = make_patients(w, RollingConfig(duration_model="bayes", weeks_measured=10, plan_samples=50), seed=2)
+    assert np.array_equal(a.true_minutes, b.true_minutes)
+    assert b.plan.shape == a.plan.shape and np.isfinite(b.plan).all()

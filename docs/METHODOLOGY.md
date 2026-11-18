@@ -152,6 +152,86 @@ $V_{sp} = \hat\tau^2 + \text{se}(\hat m_{sp})^2$ is the prior variance: $\tau^2$
 
 With no surgeon effect ($\beta_s = 0$), the prior mean is just the procedure's average across surgeons and $\tau$ also absorbs differences in surgeon speed. The surgeon effect is on by default because it shrinks towards a better prior: in 30 synthetic worlds with a median of 15 past cases per pair, the error in the pair averages (root mean square, log scale) was 0.112 from each pair's own cases, 0.095 with partial pooling towards the procedure average, and 0.084 with the surgeon effect.
 
+### 3.2 Bayesian model on a grid: the spreads uncertain too
+
+Code: `fit_bayes` in [`durations.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/src/theatre_sched/durations.py); check: [`scripts/run_coverage.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/scripts/run_coverage.py)
+
+The hierarchical model estimates $\tau$ and each $\sigma_p$ once and then treats the estimates as exact. When pairs have few past cases, both are uncertain, so its intervals for each pair are too narrow: in 30 synthetic worlds with a typical 3 past cases per pair, its 90% intervals contained the true pair average only 80% of the time.
+
+The **Bayesian** model is the same model with the spreads left uncertain. It needs a **prior** (what is believed before the data) for each unknown: flat for $\alpha_p$ and $\beta_s$; uniform on 0 to 1 for $\tau$; and $p(\sigma_p^2) \propto 1/\sigma_p^2$ for each spread, the usual "know nothing about the scale" prior. The **posterior** (what is believed after the data) can then be split into four pieces, each drawn in turn:
+
+$$p(\sigma, \tau, \gamma, \theta \mid y) = p(\sigma \mid y)\; p(\tau \mid \sigma, y)\; p(\gamma \mid \tau, \sigma, y)\; p(\theta \mid \gamma, \tau, \sigma, y)$$
+
+where $p(a \mid b)$ means "the distribution of $a$ given $b$", $\gamma$ collects the $\alpha_p$ and $\beta_s$, and $\theta$ the pair averages. Only the second piece has no standard form, and it involves a single number, so it can be worked out on a grid. No MCMC is needed.
+
+1. **Each spread.** For procedure $p$, let $\nu_p = \sum (n_{sp} - 1)$ over its pairs (the **degrees of freedom**) and $S_p$ the sum of squared deviations of each past case from its own pair's average. With the prior above, $\sigma_p^2$ given the data is $S_p / \chi^2_{\nu_p}$, where $\chi^2_\nu$ is a **chi-squared** random number with $\nu$ degrees of freedom (a sum of $\nu$ squared standard normal draws; its average is $\nu$). This uses only the spread within pairs, and ignores the little the pair averages say about $\sigma_p$: a small simplification.
+
+   > **Worked example.** A procedure's pairs have $\nu = 40$ degrees of freedom and $S = 3.6$. The single estimate is $3.6/40 = 0.09$, so $\sigma = 0.30$. A draw with $\chi^2 = 30$ gives $\sigma^2 = 0.12$ ($\sigma = 0.35$); one with $\chi^2 = 50$ gives $0.072$ ($\sigma = 0.27$). Across many draws, 90% of the $\sigma$ values fall between 0.25 and 0.37.
+
+2. **$\tau$ on a grid.** Each pair average is $\bar y_i \sim \text{Normal}(x_i'\gamma,\ \tau^2 + v_i)$, where $v_i = \sigma_p^2/n_i$ is its sampling noise and $x_i'\gamma$ its prior mean ($x_i$ picks out its procedure's $\alpha$ and its surgeon's $\beta$). Averaging over every possible $\gamma$ (Gelman et al., *Bayesian Data Analysis*, section 5.4) leaves, for each value of $\tau$:
+
+   $$\log p(\tau \mid \sigma, y) = \text{const} - \tfrac12 \log\det(X'WX) - \tfrac12\sum_i \log(\tau^2 + v_i) - \tfrac12\sum_i \frac{(\bar y_i - x_i'\hat\gamma)^2}{\tau^2 + v_i}$$
+
+   - $W$ is the diagonal matrix of weights $1/(\tau^2 + v_i)$, $X$ stacks the rows $x_i'$, and $\hat\gamma$ is the weighted least-squares fit with those weights.
+   - The last term rewards values of $\tau$ under which the pair averages' scatter around their prior means looks typical. The middle term penalises large $\tau$ (a wide spread makes every particular set of averages less likely). The first term accounts for having estimated $\gamma$.
+
+   This is computed at 200 values of $\tau$ from 0 to 1, the values are turned into probabilities that sum to 1, a grid cell is picked with its probability, and a point is drawn uniformly within the cell.
+
+   > **Worked example.** Take the example in section 3.1 (prior mean 60 minutes, $\sigma = 0.30$, a pair with 2 cases averaging 75 minutes), and suppose the grid says $\tau$ is 0.05, 0.10 or 0.20 with probabilities 0.3, 0.4 and 0.3. The weights on the pair's own data are $2/(2 + 0.09/0.05^2) = 0.05$, $0.18$ and $2/(2 + 0.09/0.20^2) = 0.47$, giving estimates of 61, 62.5 and 67 minutes. Averaged with those probabilities, the estimate is about 63 minutes, and the 90% interval widens from 54–73 minutes (with $\tau$ fixed at 0.10) to about 53–76: the doubt about $\tau$ is now in the answer.
+
+3. **The coefficients**, given $\tau$ and $\sigma$: $\gamma \sim \text{Normal}\big(\hat\gamma,\ (X'WX)^{-1}\big)$.
+4. **Each pair's average**, given the rest: $\theta_i \sim \text{Normal}\big(w_i \bar y_i + (1 - w_i)\, x_i'\gamma,\ w_i v_i\big)$ with $w_i = \tau^2/(\tau^2 + v_i)$, as in section 3.1. A pair with no history gets $\text{Normal}(x'\gamma, \tau^2)$.
+
+The fit draws 1,000 such parameter sets, which takes about a second. When planning, each Monte Carlo draw uses one parameter set, shared by every patient of a pair (and every pair of a procedure, for $\sigma$), so the draws carry the uncertainty in $\tau$ and $\sigma$ as well as in each pair.
+
+**Are its intervals honest?** In 30 synthetic worlds for each amount of history, the share of 90% intervals for a pair's typical log time that contained the true value:
+
+| Typical past cases per pair | Hierarchical: intervals containing the truth | Bayesian (grid) | Hierarchical: average width | Bayesian: average width |
+|---|---|---|---|---|
+| 3 | 80% | 89% | 0.40 | 0.50 |
+| 15 | 83% | 88% | 0.21 | 0.24 |
+| 50 | 87% | 89% | 0.14 | 0.15 |
+| 200 | 89% | 90% | 0.08 | 0.08 |
+
+The Bayesian model's intervals hold close to 90% at every amount of history (88–90%, against 80% for the hierarchical model at 3 cases), and they are wider only where they need to be: 25% wider at 3 cases, the same at 200, where the spreads are pinned down and the two models agree.
+
+**Does it help the planner?** In Part 1's booking experiment (section 5) at a 10% overrun limit, with a typical 3 past cases per pair, the riskiest tenth of the Bayesian planner's lists overrun 15% of the time, against 25% for the hierarchical planner, 45% for the plug-in planner and 9.6% for a planner that knew the true durations. With 15 past cases the figures are 12.3%, 13.0%, 16.3% and 9.6%, and with 200 the planners converge.
+
+### 3.3 The same model by MCMC (PyMC)
+
+Code: [`scripts/check_pymc.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/scripts/check_pymc.py)
+
+The grid works because, once $\tau$ and $\sigma$ are fixed, everything else is normal. **Markov chain Monte Carlo** (MCMC) needs no such shortcut: it takes a random walk through all the unknowns at once (here 25 pair averages, 6 procedure averages, 4 surgeon speeds, 6 spreads and $\tau$), built so that over a long walk the time spent near each value is proportional to its posterior probability. PyMC's sampler, **NUTS** (the No-U-Turn Sampler), uses the slope of the posterior to make long, efficient moves. The cost is that its draws are correlated and only approximately from the posterior until the chains have run long enough, which has to be checked.
+
+To check the machinery, the same model with the same priors is fitted to one sparse synthetic world (a typical 3 past cases per pair) both ways. The grid is the answer key.
+
+Posterior of $\tau$ (true value 0.08):
+
+| | 5% | 25% | median | 75% | 95% |
+|---|---|---|---|---|---|
+| Grid | 0.006 | 0.030 | 0.061 | 0.105 | 0.184 |
+| PyMC, non-centred | 0.006 | 0.030 | 0.059 | 0.099 | 0.171 |
+| PyMC, centred | 0.022 | 0.044 | 0.072 | 0.111 | 0.182 |
+
+The grid and the non-centred PyMC fit agree: the quantiles of $\tau$ differ by at most 0.013, and the pairs' posterior medians by at most 0.014 on the log scale (about 1.4%). Diagnostics:
+
+| Form | Divergences | Largest R-hat | Smallest effective sample size | ESS for tau | Seconds |
+|---|---|---|---|---|---|
+| Non-centred | 1 | 1.005 | 860 | 860 | 21 |
+| Centred | 190 | 1.040 | 190 | 190 | 31 |
+
+The two posteriors for $\tau$ are plotted in [`results/pymc_tau.png`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/results/pymc_tau.png) and in the dashboard's Duration model tab.
+
+Three diagnostics, each described in the code:
+
+- **R-hat** compares the spread between chains (and halves of chains) with the spread within them. Near 1.00 means the four chains agree; above about 1.01 suggests they haven't mixed.
+- **Effective sample size (ESS)** is how many independent draws the correlated chain is worth: 860 for $\tau$ from 4,000 draws.
+- **Divergences** are moves where the sampler's numerical path broke down, usually in a region of the posterior too sharply curved for its step size. A handful can be noise; hundreds mean parts of the posterior are not being explored.
+
+**Centred and non-centred.** Written the natural way, $\theta_i \sim \text{Normal}(x_i'\gamma, \tau)$ (the **centred** form), the posterior has a "funnel": when $\tau$ is small, every $\theta_i$ must sit very close to its prior mean, a narrow neck the sampler can't enter with steps sized for the wide part. It produced 190 divergences, an R-hat of 1.04, and a posterior for $\tau$ pushed away from zero (its 5th percentile 0.022, against 0.006 from the grid). Written as $\theta_i = x_i'\gamma + \tau z_i$ with $z_i \sim \text{Normal}(0, 1)$ (the **non-centred** form), the sampler moves through $z$, which has the same shape whatever $\tau$ is, and the problem goes away: 1 divergence, R-hat 1.005, and the grid's answer.
+
+So, for this model, the grid gives the same answer about twenty times faster and with nothing to diagnose. MCMC becomes the right tool once the model has more than one uncertain spread, for example surgeons grouped within subspecialties each with their own spread, or case times with heavier tails than the lognormal; a published Bayesian model of case durations with few past cases (Gañan-Cardenas et al., 2022) has that kind of structure.
+
 ---
 
 ## 4. Evaluating a list with Monte Carlo simulation
@@ -431,12 +511,13 @@ Code: [`scenarios.py`](https://github.com/jackcormacwright1/theatre_scheduler/bl
 
 ## 8. Checking the work
 
-Code: [`tests/`](https://github.com/jackcormacwright1/theatre_scheduler/tree/main/tests) (45 automated tests, run with `pytest`)
+Code: [`tests/`](https://github.com/jackcormacwright1/theatre_scheduler/tree/main/tests) (50 automated tests, run with `pytest`)
 
 - **The Monte Carlo against a known answer.** For a single lognormal case, the simulated overrun probability matches the exact tail probability within 4 Monte Carlo standard errors.
 - **Arithmetic of lists.** Changeovers are counted between cases only. Fixed durations give certain outcomes. Touch time excludes changeovers and overrun (the worked example in section 4 is a test).
 - **The duration fit.** With plenty of data, the plug-in estimates recover the true parameters. Sparse pairs borrow the pooled spread.
 - **The hierarchical model.** With plenty of data it agrees with the plug-in estimates. A pair with one unusual case is pulled towards the prior, lands between its own average and the prior, and keeps a wide posterior. Draws for two patients of the same pair are correlated, and draws for different pairs aren't. A pair with no history gets the prior. Across synthetic worlds, $\hat\tau$ recovers the true surgeon–procedure deviation (0.08), and is larger without the surgeon effect, as it should be. Choosing a duration model leaves the patients and their true case times unchanged.
+- **The Bayesian model.** On 400 simulated pair averages with a known spread of 0.1, the grid posterior for $\tau$ peaks within 0.02 of it. With plenty of data, its pair estimates agree with the hierarchical model's to within 0.02 on the log scale; with sparse data its intervals are wider. Its spread draws have the average the chi-squared formula gives. Draws for patients of the same pair are correlated, pairs with no history get the prior, and the year-long simulation runs with it as the planner. The MCMC check (section 3.3) is a separate script, as PyMC isn't needed by anything else.
 - **Starting from today's list.** The starting waits have the share over target asked for, none beyond the longest wait, and the triangular mean beyond the target. The week the target is met needs 4 weeks in a row (a single good week doesn't count). A run starts with exactly the list asked for, however it is described, and settled runs give exactly the same results as before the option was added. More extra lists leave fewer patients over target after 26 weeks, and a backlog concentrated on one surgeon clears more slowly than the same backlog shared. Pasted counts are read in the formats listed above, a band straddling the target counts in proportion, and an extract with more surgeons than the scenario is refused with a message saying how many are needed.
 - **Subspecialties and pooled lists.** Each surgeon does exactly the shared procedures plus their subspecialty's. With pooled lists, every patient operated on was operated on by a surgeon who does their procedure (the otologists only ever take grommets and tonsils), some patients do move between surgeons, and a patient's case with their own surgeon takes exactly what it would on an own list. Own-list runs give exactly the same results as before pooling was added. A backlog on one surgeon leaves fewer patients over target after 26 weeks and clears sooner when lists are pooled.
 - **Schedulers.** No patient is booked twice, or on another surgeon's list. Every chance-constrained list meets its limit on the planning draws, and booking to averages respects the fill fraction.
@@ -455,7 +536,7 @@ Three investigations during development changed the model or its interpretation:
 1. **Was the plug-in planner's poor calibration a bug, or small samples?** Rerunning Part 1 with 200 past cases per pair made the plug-in planner match the true-durations planner. That confirmed small samples.
 2. **Abrupt waiting-time thresholds.** Without leave, waiting times jumped from failing to meeting every target within half a list a week, which is unrealistic. Adding two-week leave blocks (a 42-week operating year) gave the gradual curves reported.
 3. **Unexpectedly low utilisation.** Rough arithmetic suggested higher touch utilisation than the simulation produced. Tracing it showed lists running short of patients, because each list can only be filled from its own surgeon's queue. The "short of patients" measure was added to report it, and later pooled lists (section 6.9).
-4. **Are the hierarchical model's intervals honest?** Across 30 worlds, the 90% posterior intervals for the pair averages contained the true value 80% of the time with a median of 3 past cases per pair, 83% with 15, 87% with 50 and 89% with 200. They are somewhat too narrow when data are sparse, because the fit treats $\hat\sigma_p$ and $\hat\tau$ as known. This is one reason the hierarchical planner improves on the plug-in planner's calibration without reaching the true-durations planner's (see the README).
+4. **Are the hierarchical model's intervals honest?** Across 30 worlds, the 90% posterior intervals for the pair averages contained the true value 80% of the time with a median of 3 past cases per pair, 83% with 15, 87% with 50 and 89% with 200. They are somewhat too narrow when data are sparse, because the fit treats $\hat\sigma_p$ and $\hat\tau$ as known. This led to the Bayesian model on a grid (section 3.2), whose intervals hold at 88–90% throughout, checked in turn against an MCMC fit of the same model (section 3.3).
 
 ---
 
@@ -502,7 +583,8 @@ Three investigations during development changed the model or its interpretation:
 | Cancellation tolerance | 30 minutes | Parts 2–3 |
 | Planner draws per patient | 500 | Parts 2–3 |
 | Hierarchical model | surgeon effect on; $\tau$ floored at 0.01; method of moments | All parts |
-| Planner's duration model | plug-in (scripts and dashboard default); hierarchical and true durations as options | All parts |
+| Bayesian model (grid) | priors: flat on $\alpha_p, \beta_s$; $\tau$ uniform on 0–1; $p(\sigma^2) \propto 1/\sigma^2$; 200 grid points; 1,000 parameter draws | All parts |
+| Planner's duration model | plug-in (scripts and dashboard default); hierarchical, Bayesian and true durations as options | All parts |
 | Warm-up, measured weeks | 26, 52 | Parts 2–3 |
 | Runs (seeds) | 20 (Part 1), 10 (scripts), 5 (dashboard default) | All |
 
@@ -510,7 +592,7 @@ Three investigations during development changed the model or its interpretation:
 
 ## 11. Next steps
 
-1. **A fully Bayesian duration model.** The hierarchical model (section 3.1) treats $\hat\sigma_p$ and $\hat\tau$ as known, which makes its intervals a little too narrow when data are sparse. Fitting the same model by MCMC (in PyMC or Stan) would carry that uncertainty too. The estimates could also be updated as cases happen through the year rather than fixed at the start.
+1. **A richer Bayesian duration model, by MCMC.** The grid model (section 3.2) handles one uncertain spread. Grouping surgeons within subspecialties, each group with its own spread, or allowing heavier-tailed case times, needs MCMC (section 3.3). The estimates could also be updated as cases happen through the year rather than fixed at the start.
 2. **Partial pooling of lists.** Let some patients decline to move, or pool only patients past a set wait, to see how much of the pooled gain survives realistic limits.
 3. **Pressure.** Add seasonal demand and winter list cancellations.
 4. **An exact benchmark** for Part 1's heuristic: solve the same sampled problem as an integer programme.
@@ -522,7 +604,10 @@ Three investigations during development changed the model or its interpretation:
 - Cardoen B, Demeulemeester E, Beliën J (2010). Operating room planning and scheduling: a literature review. *European Journal of Operational Research* 201(3): 921–932.
 - Charnes A, Cooper WW (1959). Chance-constrained programming. *Management Science* 6(1): 73–79.
 - Denton B, Viapiano J, Vogl A (2007). Optimization of surgery sequencing and scheduling decisions under uncertainty. *Health Care Management Science* 10(1): 13–24.
+- Gañan-Cardenas E, Cardona Jiménez J, Pemberthy-R JI (2022). Bayesian hierarchical modeling of operating room times for surgeries with few or no historic data. *Journal of Clinical Monitoring and Computing* 36(3): 687–702.
+- Gelman A, Carlin JB, Stern HS, Dunson DB, Vehtari A, Rubin DB (2013). *Bayesian Data Analysis*, 3rd edition. CRC Press. Section 5.4: computing the hierarchical normal model's posterior on a grid.
 - Gelman A, Hill J (2007). *Data Analysis Using Regression and Multilevel/Hierarchical Models*. Cambridge University Press.
+- Hoffman MD, Gelman A (2014). The No-U-Turn Sampler. *Journal of Machine Learning Research* 15: 1593–1623.
 - Strum DP, May JH, Vargas LG (2000). Modeling the uncertainty of surgical procedure times: comparison of log-normal and normal models. *Anesthesiology* 92(4): 1160–1167.
 - The importance of surgical cutting time as a key performance indicator alongside touchtime utilisation in operating theatre efficiency optimisation (2024). *Cureus*. Definition of capped touch-time utilisation and the GIRFT 85% target.
 - NHS England. Referral to treatment consultant-led waiting times: rules suite. Clock rules, including that hospital cancellations do not stop the clock.

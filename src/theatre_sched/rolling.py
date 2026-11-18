@@ -31,7 +31,8 @@ Booking rules (how full a list may be):
 * ``monte_carlo`` a list is allowed only if the planner's Monte Carlo estimate of P(list overruns)
                   is at most ``alpha``. The planner's duration model is ``plugin`` (pair estimates treated
                   as exact), ``hierarchical`` (partial pooling, with the uncertainty carried into the
-                  draws) or ``oracle`` (the true durations, for reference).
+                  draws), ``bayes`` (the same, with the spreads tau and sigma uncertain too, fitted on a
+                  grid) or ``oracle`` (the true durations, for reference).
 * ``average``     each case is assumed to take its surgeon's historical average time, and the list is
                   filled up to ``fill_fraction`` of the session. With ``in_turn`` this is plain
                   first-come-first-served booking.
@@ -69,13 +70,12 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .durations import LognormalPairModel, fit_hierarchical, fit_plugin
-from .evaluate import list_total_minutes
+from .durations import LognormalPairModel, fit_bayes, fit_hierarchical, fit_plugin
 from .synthetic import World
 
 POLICIES = ("in_turn", "ratio_fill", "touch_fill")
 BOOKING_RULES = ("monte_carlo", "average")
-DURATION_MODELS = ("plugin", "hierarchical", "oracle")
+DURATION_MODELS = ("plugin", "hierarchical", "bayes", "oracle")
 
 
 @dataclass
@@ -277,6 +277,8 @@ def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
         planner = fit.model
     elif cfg.duration_model == "hierarchical":
         planner = fit_hierarchical(world.history)
+    elif cfg.duration_model == "bayes":
+        planner = fit_bayes(world.history, seed=seed)
     elif cfg.duration_model == "oracle":
         planner = truth
     else:
