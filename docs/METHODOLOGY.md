@@ -10,7 +10,7 @@ Code: [github.com/jackcormacwright1/theatre_scheduler](https://github.com/jackco
 
 ## 1. The questions
 
-1. **Booking one window (Part 1).** If each case's duration is uncertain, how many more patients can be booked onto a fixed set of theatre lists, at the same risk of lists overrunning, by modelling that uncertainty with Monte Carlo simulation rather than booking to average times? What does any gain depend on?
+1. **Booking one window (Part 1).** If each case's duration is uncertain, how many more patients can be booked onto a fixed set of theatre lists, at the same risk of lists overrunning, by modelling that uncertainty with Monte Carlo simulation rather than booking to average times? What does any gain depend on? And does a hierarchical duration model, which shares information between surgeons and procedures, help the planner keep to its own overrun limit?
 2. **A year of booking (Part 2).** For four specialties, how many extra theatre lists are needed to treat 95% of patients within 6 weeks of being added to the waiting list? How does the answer depend on how that target is measured? What happens to theatre utilisation?
 3. **Scenario comparison (Part 3, the dashboard).** For any two configurations of demand, capacity and booking rules, what is the difference in patients treated, waiting times, lists and theatre minutes, and is it distinguishable from noise?
 
@@ -94,7 +94,7 @@ Each world is generated from a seed. The surgeon parameters, the history and the
 
 ---
 
-## 3. The planner's duration model
+## 3. The planner's duration models
 
 Code: [`durations.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/src/theatre_sched/durations.py)
 
@@ -113,6 +113,44 @@ The planner then treats $\hat\mu$ and $\hat\sigma$ as if they were exact. That i
 **Historical average.** The booking-to-averages rule uses the plain arithmetic mean of each pair's past durations, $\bar m_{sp} = \frac{1}{n}\sum x_k$: the "average time it takes that surgeon".
 
 **Oracle.** For reference, an oracle planner uses the true $\mu_{sp}, \sigma_p$. It shows what perfect knowledge of durations would be worth.
+
+### 3.1 Hierarchical model (partial pooling)
+
+Code: `fit_hierarchical` in [`durations.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/src/theatre_sched/durations.py)
+
+The plug-in model's weakness is that a pair's average from two cases is treated as exactly as reliable as one from two hundred. The hierarchical model (Gelman and Hill, 2007) treats each pair's true average $\theta_{sp}$ as uncertain, and estimates it from two sources: the pair's own cases, and what the rest of the data says about a surgeon of that speed doing that procedure.
+
+**The model**, on the log scale ($y = \log$ of a case time in minutes):
+
+$$y_{spk} = \theta_{sp} + \sigma_p\,\varepsilon_{spk}, \qquad \varepsilon_{spk} \sim \text{Normal}(0, 1)$$
+
+$$\theta_{sp} \sim \text{Normal}\big(m_{sp},\ \tau^2\big), \qquad m_{sp} = \alpha_p + \beta_s$$
+
+- $k$ indexes a pair's past cases. $\theta_{sp}$ is the pair's true average log time and $\sigma_p$ how much single cases of procedure $p$ vary around it.
+- $m_{sp}$ is the **prior mean**: what you'd expect before seeing the pair's own cases. $\alpha_p$ is procedure $p$'s typical log time for an average surgeon, and $\beta_s$ is surgeon $s$'s speed (negative is faster), estimated from all their procedures, with the $\beta_s$ summing to zero.
+- $\tau$ is how far pairs' true averages scatter around $m_{sp}$: the surgeon-specific part that the procedure and the surgeon's general speed don't explain.
+
+**Fitting** is empirical Bayes by the method of moments (no MCMC), repeated until $\tau$ settles:
+
+1. $\hat\sigma_p$ is the pooled within-pair spread, as in the plug-in model.
+2. Fit the pair averages $\bar y_{sp}$ to $\alpha_p + \beta_s$ by weighted least squares, with weights $1/(\tau^2 + \hat\sigma_p^2/n_{sp})$: a pair's average is noisier the fewer cases it rests on.
+3. Estimate $\tau^2$ from the residuals $r_{sp} = \bar y_{sp} - \hat m_{sp}$: their spread is $\tau^2$ plus sampling noise $\hat\sigma_p^2/n_{sp}$, so $\hat\tau^2 = \text{mean}\big(r_{sp}^2 \cdot N/(N-q) - \hat\sigma_p^2/n_{sp}\big)$, floored at $0.01^2$. $N$ is the number of pairs and $q$ the number of fitted coefficients.
+
+**Each pair's estimate** is then a weighted average of its own average and the prior mean:
+
+$$w_{sp} = \frac{V_{sp}}{V_{sp} + \hat\sigma_p^2 / n_{sp}} = \frac{n_{sp}}{n_{sp} + k_{sp}}, \qquad k_{sp} = \frac{\hat\sigma_p^2}{V_{sp}}$$
+
+$$\hat\theta_{sp} = w_{sp}\,\bar y_{sp} + (1 - w_{sp})\,\hat m_{sp}, \qquad v_{sp} = w_{sp}\,\frac{\hat\sigma_p^2}{n_{sp}}$$
+
+$V_{sp} = \hat\tau^2 + \text{se}(\hat m_{sp})^2$ is the prior variance: $\tau^2$ plus the uncertainty in the estimated prior mean itself. $w_{sp}$ is the weight on the pair's own data, and $k_{sp}$ is the number of cases at which the pair's own data and the prior get equal weight. $\hat\theta_{sp}$ is the posterior mean and $v_{sp}$ the posterior variance: how uncertain the pair's average still is.
+
+> **Worked example.** A procedure's prior mean for a surgeon of this speed is 60 minutes. Single cases vary with $\sigma = 0.30$ on the log scale, and pairs scatter around the prior with $\tau = 0.10$, so $k = 0.30^2/0.10^2 = 9$ (ignoring the small uncertainty in the prior mean).
+> - The surgeon has done the procedure **twice**, averaging 75 minutes. Then $w = 2/(2 + 9) = 0.18$, and $\hat\theta = 0.18\log 75 + 0.82\log 60$, which is **62.5 minutes**, much nearer 60 than 75. The posterior standard deviation is $\sqrt{0.18 \times 0.09/2} = 0.09$, so a 90% interval for the pair's typical time is about 54 to 73 minutes.
+> - With **twenty** cases averaging 75 minutes, $w = 20/29 = 0.69$ and the estimate is **70.0 minutes** (90% interval about 64 to 77). The more evidence the pair has, the more it speaks for itself.
+
+**Using it to plan.** The Monte Carlo draws carry the remaining uncertainty. In each draw $r$, the pair's average is drawn once, $\theta_{sp}^{(r)} \sim \text{Normal}(\hat\theta_{sp}, v_{sp})$, and shared by all of that pair's patients, whose case times are then $\exp\big(\theta_{sp}^{(r)} + \hat\sigma_p\,\varepsilon\big)$. Sharing matters: if a surgeon is in fact slower at a procedure than the data suggest, all four of their cases of it on one list run slow together, and the list total moves by more than independent errors would allow. A pair with no history at all gets the prior, $\theta_{sp} \sim \text{Normal}(\hat m_{sp}, V_{sp})$.
+
+With no surgeon effect ($\beta_s = 0$), the prior mean is just the procedure's average across surgeons and $\tau$ also absorbs differences in surgeon speed. The surgeon effect is on by default because it shrinks towards a better prior: in 30 synthetic worlds with a median of 15 past cases per pair, the error in the pair averages (root mean square, log scale) was 0.112 from each pair's own cases, 0.095 with partial pooling towards the procedure average, and 0.084 with the surgeon effect.
 
 ---
 
@@ -184,7 +222,9 @@ This is a chance constraint (Charnes and Cooper, 1959), estimated by the Monte C
 - **Matched-risk comparison.** Within each world, the book-to-average curve of patients booked against realised overrun rate (one point per fill fraction) is linearly interpolated at the overrun rate a chance-constrained schedule achieved. The difference is "extra patients at the same overrun rate", averaged across worlds with its standard error. Rates outside the baseline's range are not extrapolated.
 - **Calibration.** For a target $\alpha$, compare the realised overrun probability of each list with $\alpha$, both on average and at the 90th percentile across lists (the riskiest tenth).
 
-**Sensitivity.** The comparison is rerun with a median of 200 past cases per pair instead of 15, holding everything else in each world fixed (section 2.4).
+**Duration models.** The chance-constrained search is run with the plug-in model, the hierarchical model (section 3.1) and the true durations, on the same patients and lists.
+
+**Sensitivity.** The comparison is rerun with a median of 3, 15, 50 and 200 past cases per pair, holding everything else in each world fixed (section 2.4; [`scripts/run_history_sweep.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/scripts/run_history_sweep.py)).
 
 ---
 
@@ -306,11 +346,12 @@ Code: [`scenarios.py`](https://github.com/jackcormacwright1/theatre_scheduler/bl
 
 ## 8. Checking the work
 
-Code: [`tests/`](https://github.com/jackcormacwright1/theatre_scheduler/tree/main/tests) (28 automated tests, run with `pytest`)
+Code: [`tests/`](https://github.com/jackcormacwright1/theatre_scheduler/tree/main/tests) (34 automated tests, run with `pytest`)
 
 - **The Monte Carlo against a known answer.** For a single lognormal case, the simulated overrun probability matches the exact tail probability within 4 Monte Carlo standard errors.
 - **Arithmetic of lists.** Changeovers are counted between cases only. Fixed durations give certain outcomes. Touch time excludes changeovers and overrun (the worked example in section 4 is a test).
 - **The duration fit.** With plenty of data, the plug-in estimates recover the true parameters. Sparse pairs borrow the pooled spread.
+- **The hierarchical model.** With plenty of data it agrees with the plug-in estimates. A pair with one unusual case is pulled towards the prior, lands between its own average and the prior, and keeps a wide posterior. Draws for two patients of the same pair are correlated, and draws for different pairs aren't. A pair with no history gets the prior. Across synthetic worlds, $\hat\tau$ recovers the true surgeon–procedure deviation (0.08), and is larger without the surgeon effect, as it should be. Choosing a duration model leaves the patients and their true case times unchanged.
 - **Schedulers.** No patient is booked twice, or on another surgeon's list. Every chance-constrained list meets its limit on the planning draws, and booking to averages respects the fill fraction.
 - **The year-long simulation.**
   - No patient is operated on before being added.
@@ -327,6 +368,7 @@ Three investigations during development changed the model or its interpretation:
 1. **Was the plug-in planner's poor calibration a bug, or small samples?** Rerunning Part 1 with 200 past cases per pair made the plug-in planner match the true-durations planner. That confirmed small samples.
 2. **Abrupt waiting-time thresholds.** Without leave, waiting times jumped from failing to meeting every target within half a list a week, which is unrealistic. Adding two-week leave blocks (a 42-week operating year) gave the gradual curves reported.
 3. **Unexpectedly low utilisation.** Rough arithmetic suggested higher touch utilisation than the simulation produced. Tracing it showed lists running short of patients, because each list can only be filled from its own surgeon's queue. The "short of patients" measure was added to report it.
+4. **Are the hierarchical model's intervals honest?** Across 30 worlds, the 90% posterior intervals for the pair averages contained the true value 80% of the time with a median of 3 past cases per pair, 83% with 15, 87% with 50 and 89% with 200. They are somewhat too narrow when data are sparse, because the fit treats $\hat\sigma_p$ and $\hat\tau$ as known. This is one reason the hierarchical planner improves on the plug-in planner's calibration without reaching the true-durations planner's (see the README).
 
 ---
 
@@ -368,6 +410,8 @@ Three investigations during development changed the model or its interpretation:
 | Booking rule; overrun limit $\alpha$; fill $f$ | Monte Carlo (Part 2 scripts). In the dashboard, scenario A defaults to average and B to Monte Carlo. 10%; 100% | Parts 2–3 |
 | Cancellation tolerance | 30 minutes | Parts 2–3 |
 | Planner draws per patient | 500 | Parts 2–3 |
+| Hierarchical model | surgeon effect on; $\tau$ floored at 0.01; method of moments | All parts |
+| Planner's duration model | plug-in (scripts and dashboard default); hierarchical and true durations as options | All parts |
 | Warm-up, measured weeks | 26, 52 | Parts 2–3 |
 | Runs (seeds) | 20 (Part 1), 10 (scripts), 5 (dashboard default) | All |
 
@@ -375,7 +419,7 @@ Three investigations during development changed the model or its interpretation:
 
 ## 11. Next steps
 
-1. **A hierarchical duration model.** The main result of Part 1 is that the planner is limited by small samples. A hierarchical model estimates each surgeon–procedure time as a weighted average of the pair's own data and the procedure average, weighted by how much data the pair has ("partial pooling"; Gelman and Hill, 2007). It then carries the remaining uncertainty about each surgeon's true average into the Monte Carlo draws, shared by all of that surgeon's cases on a list.
+1. **A fully Bayesian duration model.** The hierarchical model (section 3.1) treats $\hat\sigma_p$ and $\hat\tau$ as known, which makes its intervals a little too narrow when data are sparse. Fitting the same model by MCMC (in PyMC or Stan) would carry that uncertainty too. The estimates could also be updated as cases happen through the year rather than fixed at the start.
 2. **Pooled lists.** Let any surgeon in the specialty take a patient, with that surgeon's durations.
 3. **Pressure.** Add seasonal demand and winter list cancellations.
 4. **An exact benchmark** for Part 1's heuristic: solve the same sampled problem as an integer programme.

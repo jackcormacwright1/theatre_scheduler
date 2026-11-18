@@ -10,6 +10,7 @@ Methods:
   avg-queue  book to average case times, conventional queue order (priority, then wait)
   avg-ratio  book to average case times, most weight per expected minute first
   cc-plugin  chance-constrained, using the plug-in duration model (what a real planner could do)
+  cc-hier    chance-constrained, using the hierarchical (partial pooling) duration model
   cc-oracle  chance-constrained, using the true durations (an upper reference: perfect knowledge)
 
 Writes results/runs.csv, results/summary.csv, results/summary.md,
@@ -32,6 +33,7 @@ import pandas as pd
 
 from theatre_sched import (
     LognormalPairModel,
+    fit_hierarchical,
     WorldConfig,
     add_weights,
     book_to_average,
@@ -49,12 +51,14 @@ LABELS = {
     "avg-queue": "Book to average (queue order)",
     "avg-ratio": "Book to average (ratio order)",
     "cc-plugin": "Chance-constrained (plug-in model)",
+    "cc-hier": "Chance-constrained (hierarchical model)",
     "cc-oracle": "Chance-constrained (true durations)",
 }
 
-# Colours: reference categorical palette, slots 1-3; the oracle is a neutral reference line.
-COLOURS = {"avg-queue": "#2a78d6", "avg-ratio": "#eb6834", "cc-plugin": "#1baf7a", "cc-oracle": "#52514e"}
-MARKERS = {"avg-queue": "o", "avg-ratio": "s", "cc-plugin": "D", "cc-oracle": "^"}
+# Colours: reference categorical palette, slots 1-4; the oracle is a neutral reference line.
+COLOURS = {"avg-queue": "#2a78d6", "avg-ratio": "#eb6834", "cc-plugin": "#1baf7a", "cc-hier": "#eda100",
+           "cc-oracle": "#52514e"}
+MARKERS = {"avg-queue": "o", "avg-ratio": "s", "cc-plugin": "D", "cc-hier": "v", "cc-oracle": "^"}
 INK, MUTED, GRID, AXIS, SURFACE = "#0b0b0b", "#898781", "#e1e0d9", "#c3c2b7", "#fcfcfb"
 
 
@@ -66,6 +70,7 @@ def run_world(seed: int, cfg_in: WorldConfig, lam: float, n_plan: int, n_eval: i
     truth = LognormalPairModel(w.true_params)
 
     plan = fit.model.sample(p, n_plan, np.random.default_rng([seed, 1]))
+    hier = fit_hierarchical(w.history).sample(p, n_plan, np.random.default_rng([seed, 4]))
     oracle = truth.sample(p, n_plan, np.random.default_rng([seed, 2]))
     reality = truth.sample(p, n_eval, np.random.default_rng([seed, 3]))
     hist_mean = fit.historical_mean(p)
@@ -76,6 +81,7 @@ def run_world(seed: int, cfg_in: WorldConfig, lam: float, n_plan: int, n_eval: i
         jobs.append(("avg-ratio", f, lambda f=f: book_to_average(p, w.sessions, hist_mean, cfg.turnaround_minutes, f, "ratio")))
     for a in ALPHAS:
         jobs.append(("cc-plugin", a, lambda a=a: chance_constrained(p, w.sessions, plan, cfg.turnaround_minutes, a)))
+        jobs.append(("cc-hier", a, lambda a=a: chance_constrained(p, w.sessions, hier, cfg.turnaround_minutes, a)))
         jobs.append(("cc-oracle", a, lambda a=a: chance_constrained(p, w.sessions, oracle, cfg.turnaround_minutes, a)))
 
     rows, list_rows = [], []
@@ -123,7 +129,7 @@ def style_axes(ax):
 def plot_frontier(summary: pd.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5), facecolor=SURFACE)
     style_axes(ax)
-    for method in ["avg-queue", "avg-ratio", "cc-plugin", "cc-oracle"]:
+    for method in ["avg-queue", "avg-ratio", "cc-plugin", "cc-hier", "cc-oracle"]:
         s = summary[summary.method == method].sort_values("overrun_rate")
         ls = "--" if method == "cc-oracle" else "-"
         ax.plot(100 * s["overrun_rate"], s["patients_booked"], ls, color=COLOURS[method], lw=2,
@@ -147,7 +153,7 @@ def plot_calibration(summary: pd.DataFrame, path: Path) -> None:
     ax.plot([0, lim], [0, lim], color=AXIS, lw=1, zorder=1)
     ax.annotate("realised = target", (lim * 0.80, lim * 0.80), xytext=(-8, 10), textcoords="offset points",
                 ha="right", fontsize=8, color=MUTED)
-    for method in ["cc-plugin", "cc-oracle"]:
+    for method in ["cc-plugin", "cc-hier", "cc-oracle"]:
         s = summary[summary.method == method].sort_values("setting")
         ls = "--" if method == "cc-oracle" else "-"
         ax.plot(100 * s["setting"], 100 * s["overrun_rate"], ls, color=COLOURS[method], lw=2, marker=MARKERS[method],
@@ -201,7 +207,7 @@ def main() -> None:
     # Headline: extra patients at matched realised overrun rate, mean and standard error across worlds.
     head = []
     for base in ["avg-queue", "avg-ratio"]:
-        for m in ["cc-plugin", "cc-oracle"]:
+        for m in ["cc-plugin", "cc-hier", "cc-oracle"]:
             d = extra_at_matched_risk(runs, base, m)
             for setting, g in d.groupby("setting"):
                 head.append({"method": m, "vs": base, "setting": setting, "worlds": len(g),

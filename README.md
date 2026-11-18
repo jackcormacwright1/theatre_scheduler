@@ -4,9 +4,11 @@ Booking elective theatre lists means choosing which patients from a waiting list
 
 The project has two parts:
 
-- **[Part 1](#part-1-one-booking-window): one four-week booking window.** How many more patients can be booked, at the same risk of overrunning, if each case's uncertainty is modelled explicitly with Monte Carlo simulation rather than booking to average times? And what does that gain depend on?
+- **[Part 1](#part-1-one-booking-window): one four-week booking window.** How many more patients can be booked, at the same risk of overrunning, if each case's uncertainty is modelled explicitly with Monte Carlo simulation rather than booking to average times? What does that gain depend on? And does a **hierarchical (partial pooling) duration model** help the planner keep its overrun risk where it means to?
 - **[Part 2](#part-2-a-year-of-booking-in-four-specialties): a year of booking in four specialties.** How many extra lists does each specialty need to treat 95% of patients within 6 weeks of being added to the waiting list? How does the answer change with the way that target is measured? And what happens to the 85% theatre utilisation target?
 - **[Part 3](#part-3-dashboard-and-scenario-comparison): a dashboard and scenario comparison.** A Streamlit app where every setting can be changed (demand, operating weeks, changeovers, booking rules and more), and two scenarios can be compared head to head. For example: how many patients, lists or theatre minutes separate optimised booking from first come, first served?
+
+**Live dashboard:** [jackcormacwright-theatresceduler.streamlit.app](https://jackcormacwright-theatresceduler.streamlit.app/)
 
 **All data here is synthetic.** See [Provenance](#provenance).
 
@@ -22,8 +24,9 @@ These come from 20 synthetic worlds, each with 5 surgeons, 300 patients and four
 2. **Modelling each case's uncertainty adds little on top, and only with good duration estimates.** With the true durations, the chance-constrained planner books about 4 more patients than a flat buffer at a 5% overrun rate, falling to under 1 at 30%. With durations estimated from the history (a median of 15 past cases per surgeon–procedure pair), it books slightly *fewer* (0.4–1.5) than the flat buffer.
 3. **With realistic amounts of history, the planner misses its own target.** It is told to keep every list at or below a 5% chance of overrunning. On average it does (4.7%), but the riskiest tenth of its lists overrun about 10% of the time or more. At a 10% target, they overrun 16% or more. Its risk is spread no more evenly than a flat buffer's.
 4. **The shortfall comes from small samples, not from the search.** Give the planner 200 past cases per pair and it matches the true-durations planner (riskiest tenth of lists at 5.4% against 4.8%, for a 5% target).
+5. **A hierarchical duration model closes about half the gap.** Estimating each surgeon–procedure time partly from the rest of the data (the procedure's typical time and the surgeon's speed on other procedures), and carrying the remaining uncertainty into the Monte Carlo draws, brings the riskiest tenth of lists from 16.3% to 13.0% at a 10% target (the true durations give 9.6%). At the same overrun rate it books 1.3 more patients than booking to average (± 0.8), where the plug-in planner books 0.6 fewer. It matters most when history is thin: with a typical 3 past cases per pair, the plug-in planner's riskiest lists overrun 45% of the time against a 10% target, and the hierarchical planner's 25%. With 200 cases the three planners converge.
 
-So the next thing to improve is the duration model, not the optimiser.
+So the duration model, not the optimiser, is what limits the planner, and partial pooling is a cheap improvement.
 
 ![Patients booked against overrun rate](results/frontier.png)
 
@@ -34,9 +37,25 @@ At roughly a 7% overrun rate (means over 20 worlds; full table in [`results/summ
 | Book to average, queue order | 15% buffer | 106.5 | 7.2% | ≥13.5% | 27.5% |
 | Book to average, ratio order | 15% buffer | 113.7 | 6.7% | ≥13.4% | 23.3% |
 | Chance-constrained, plug-in model | target 10% | 115.5 | 8.4% | ≥16.3% | 22.9% |
+| Chance-constrained, hierarchical model | target 10% | 114.6 | 6.8% | ≥13.0% | 23.0% |
 | Chance-constrained, true durations | target 10% | 116.7 | 6.7% | ≥9.6% | 22.6% |
 
 ![Planned versus realised overrun risk](results/calibration.png)
+
+### How much history the planner needs
+
+[`scripts/run_history_sweep.py`](scripts/run_history_sweep.py) reruns the comparison with a typical 3, 15, 50 and 200 past cases per surgeon–procedure pair, holding everything else fixed, at a 10% overrun limit (20 worlds each; full table in [`results/history_sweep.md`](results/history_sweep.md)):
+
+| Past cases per pair | Riskiest 10% of lists: plug-in | hierarchical | true durations | Extra patients vs booking to average: plug-in | hierarchical |
+|---|---|---|---|---|---|
+| 3 | 45.3% | 24.9% | 9.6% | −2.4 ± 1.4 | +1.7 ± 1.6 |
+| 15 | 16.3% | 13.0% | 9.6% | −0.6 ± 0.6 | +1.3 ± 0.8 |
+| 50 | 12.2% | 11.2% | 9.6% | −0.3 ± 0.8 | +0.4 ± 0.9 |
+| 200 | 10.9% | 10.3% | 9.6% | 0.0 ± 0.4 | +0.4 ± 0.5 |
+
+Extra patients are at the same overrun rate as booking to average in ratio order, ± two standard errors across worlds.
+
+![History sweep](results/history_sweep.png)
 
 ## The model
 
@@ -60,6 +79,7 @@ The 1 rewards booking anyone at all, and the urgency term rewards booking people
 ### Duration models ([`durations.py`](src/theatre_sched/durations.py))
 
 - **Plug-in.** Estimate μ and σ for each surgeon–procedure pair from its own history, then treat the estimates as exact. Pairs with fewer than 3 cases borrow the procedure's pooled σ. This is what a planner could realistically do.
+- **Hierarchical.** Each pair's estimate is a weighted average of its own average and a prior (the procedure's typical time, adjusted for the surgeon's speed on their other procedures), with weight n / (n + k) on its own n cases. k, the number of cases at which the two get equal weight, is estimated from how much pairs differ beyond what the prior explains. The remaining uncertainty in each pair's average is drawn once per Monte Carlo draw and shared by all that pair's patients, so a surgeon who is slower than the data suggest is slower on every case. Fitted by empirical Bayes (method of moments), with no MCMC. [Methodology, section 3.1](docs/METHODOLOGY.md) has the formulas and a worked example.
 - **Truth.** The world's real parameters, used to score schedules and as an oracle planner.
 
 ### Booking methods
@@ -92,7 +112,7 @@ Comparisons "at the same overrun rate" interpolate the book-to-average curve wit
 
 ## Next steps for Part 1
 
-1. **Hierarchical duration model.** Pull each surgeon–procedure estimate towards the procedure average, more strongly when the pair has little history, and carry the remaining parameter uncertainty into the Monte Carlo draws. Findings 3 and 4 say this is where the value is.
+1. **A fully Bayesian duration model.** The hierarchical model's intervals for pair averages are a little too narrow with sparse data (90% intervals contain the truth 80% of the time with 3 past cases per pair), because the fit treats the spreads σ and τ as known. MCMC would carry that uncertainty too, which may close more of the remaining calibration gap.
 2. **Exact benchmark.** Solve the same sampled problem as an integer programme to measure how far the heuristic is from optimal.
 3. **Case order within a list.** Test whether putting the more predictable cases first reduces overtime.
 
@@ -152,7 +172,7 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
 
 - **Surgeons and lists.** Each specialty has 6 surgeons, each with one all-day list a week. Each surgeon takes 10 weeks of leave a year in two-week blocks, and patients belong to their own consultant.
 - **Demand.** Poisson arrivals sized to 85% of the session time available after leave, at 15-minute changeovers. Every scenario sees exactly the same patients.
-- **Booking.** At the start of each week, everyone added before that week can be booked. The policy sets the order, and each patient goes on the first of their surgeon's lists where the planner's estimated chance of overrunning stays within the limit. The planner uses the plug-in duration model from Part 1.
+- **Booking.** At the start of each week, everyone added before that week can be booked. The policy sets the order, and each patient goes on the first of their surgeon's lists where the planner's estimated chance of overrunning stays within the limit. The planner uses the plug-in duration model from Part 1 (the dashboard can switch it to the hierarchical model or the true durations).
 - **Extra lists.** These are Saturday lists, given each week to the working surgeons with the most patients about to pass 6 weeks.
 - **On the day.** Cases run longest-expected first, using true durations. A case is cancelled if it's expected to finish more than 30 minutes after the session end. Cancelled patients go back on the list with their clock still running.
 - **Policies.**
@@ -184,11 +204,11 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
   - specialty, number of surgeons, lists per surgeon and list length;
   - operating weeks a year and extra lists per week;
   - demand, as referrals a week for the whole specialty, shared between the surgeons, so adding surgeons adds capacity rather than demand;
-  - how full lists are booked (to average times at a chosen fill %, or to a Monte Carlo overrun limit);
+  - how full lists are booked (to average times at a chosen fill %, or to a Monte Carlo overrun limit), and the Monte Carlo planner's duration model;
   - booking order and how much history the planner has;
   - changeover time and the on-the-day cancellation rule;
   - the target (weeks, and share of patients).
-- **Scenario A tab.** Headline numbers for the three waiting-time measures, utilisation, overruns and cancellations. It also charts the waiting list over time and how long treated patients waited, and can sweep extra lists to show how many each measure needs to reach the target.
+- **Scenario A tab.** The three waiting-time measures, each marked as meeting or missing the target, then utilisation, overruns and cancellations. It also charts the waiting list over time and how long treated patients waited, and can sweep extra lists to show how many each measure needs to reach the target.
 - **Compare A and B tab.** B starts as a copy of A, and you change whatever you're testing. Both run on the same synthetic hospitals and, where the demand settings match, the same patients. The tab reports the paired difference B − A with ± two standard errors and flags whether each difference is clear of the noise. It covers:
   - patients treated a year, all three 6-week measures, median and 95th-percentile waits, and waiting list size;
   - lists, session minutes, patient-in-theatre minutes and overtime minutes a year, and session minutes per patient treated;
@@ -198,6 +218,12 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
   A one-paragraph summary says the result in words. **Match B's overrun rate to A's** retunes B's booking caution so the two are compared like for like.
 
 ![Comparing two scenarios](docs/dashboard_compare.png)
+
+- **Duration model tab.** Shows partial pooling at work in one synthetic hospital: for a chosen procedure, each surgeon's own average, the hierarchical estimate and the true time, and how the weight on a pair's own data grows with its number of past cases. It also charts the history sweep above.
+
+![The duration model tab](docs/dashboard_duration.png)
+
+In the year-long simulation, the better duration model mainly shows up as fewer overruns and on-the-day cancellations rather than shorter waits. In general surgery at 24 referrals a week and a 10% limit, lists overran 3.1% of the time against 3.9% with the plug-in model (10 runs; 4.8% against 5.8% with 3 past cases per pair). The differences in waiting times were within the noise, because at that demand the waits are set by capacity rather than by how cautiously lists are booked.
 
 ## First come, first served against optimised booking
 
@@ -237,9 +263,10 @@ To deploy it on Streamlit Community Cloud:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                                   # 28 tests
-python scripts/run_experiment.py         # Part 1: about 15 seconds; writes results/
+pytest                                   # 34 tests
+python scripts/run_experiment.py         # Part 1: about a minute; writes results/
 python scripts/run_experiment.py --history-cases 200 --out results/history200
+python scripts/run_history_sweep.py      # Part 1 with 3, 15, 50 and 200 past cases per pair: about 4 minutes
 python scripts/run_capacity.py           # Part 2: about 1.5 minutes on 2 cores; writes results/capacity/
 python scripts/run_differentials.py      # Part 3: about 1.5 minutes on 2 cores; writes results/differentials/
 streamlit run app.py                     # Part 3: the dashboard (needs pip install -e ".[app]")
@@ -250,14 +277,16 @@ streamlit run app.py                     # Part 3: the dashboard (needs pip inst
 ```
 src/theatre_sched/
   synthetic.py    synthetic worlds: procedures for four specialties, surgeons, history, waiting list, sessions
-  durations.py    lognormal duration models: plug-in fit and true parameters
+  durations.py    lognormal duration models: plug-in fit, hierarchical (partial pooling) fit, true parameters
   evaluate.py     Monte Carlo scoring of lists and schedules, including touch-time utilisation
   schedule.py     Part 1: weights, book-to-average baselines, chance-constrained search
   rolling.py      Part 2: week-by-week simulation, booking rules and policies, the three 6-week measures
   scenarios.py    Part 3: run a scenario, paired A-vs-B comparison, lists-needed sweep, overrun matching
 app.py                      Part 3: the Streamlit dashboard
 requirements.txt            dependencies for Streamlit Community Cloud
+.streamlit/config.toml      the dashboard's theme
 scripts/run_experiment.py   Part 1 comparison across synthetic worlds, tables and figures
+scripts/run_history_sweep.py  Part 1 planners against the amount of history per surgeon-procedure pair
 scripts/run_capacity.py     Part 2 capacity scenarios by specialty, tables and figures
 scripts/run_differentials.py  Part 3 first-come-first-served vs optimised booking, by specialty
 docs/METHODOLOGY.md         full methodology (also the dashboard's Methodology tab)

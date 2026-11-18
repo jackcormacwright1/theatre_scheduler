@@ -9,15 +9,17 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))  # works without installing the package
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "src"))  # works without installing the package
 
-import altair as alt
-import numpy as np
-import pandas as pd
-import streamlit as st
+import altair as alt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import streamlit as st  # noqa: E402
 
-from theatre_sched.rolling import POLICIES, RollingConfig, implied_load
-from theatre_sched.scenarios import (
+from theatre_sched.durations import fit_hierarchical  # noqa: E402
+from theatre_sched.rolling import POLICIES, RollingConfig, implied_load  # noqa: E402
+from theatre_sched.scenarios import (  # noqa: E402
     MEASURE_LABELS,
     MEASURES,
     Scenario,
@@ -30,15 +32,19 @@ from theatre_sched.scenarios import (
     run,
     seed_for,
 )
-from theatre_sched.synthetic import WorldConfig, make_world
+from theatre_sched.synthetic import WorldConfig, make_world  # noqa: E402
 
-st.set_page_config(page_title="Theatre list booking simulator", page_icon="🏥", layout="wide")
+st.set_page_config(page_title="Theatre list booking simulator", page_icon="🩺", layout="wide")
 
-METHODOLOGY_FILE = Path(__file__).resolve().parent / "docs" / "METHODOLOGY.md"
+METHODOLOGY_FILE = ROOT / "docs" / "METHODOLOGY.md"
 METHODOLOGY = (METHODOLOGY_FILE.read_text(encoding="utf-8") if METHODOLOGY_FILE.exists()
                else "The methodology is in docs/METHODOLOGY.md in the project repository.")
+SWEEP_FILE = ROOT / "results" / "history_sweep.csv"
 
-BLUE, ORANGE, AQUA, MUTED = "#2a78d6", "#eb6834", "#1baf7a", "#898781"
+# Reference chart palette (categorical slots 1-4), a neutral for reference lines, and status colours.
+BLUE, ORANGE, AQUA, YELLOW = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
+NEUTRAL, MUTED, GRID, BAND = "#52514e", "#898781", "#e1e0d9", "#f0efea"
+GOOD, CRITICAL = "#0ca30c", "#d03b3b"
 SPECIALTY_NAMES = {"general_surgery": "General surgery", "orthopaedics": "Orthopaedics",
                    "gynaecology": "Gynaecology", "ent": "ENT"}
 POLICY_NAMES = {"in_turn": "In turn (urgent first, then longest wait)",
@@ -46,9 +52,13 @@ POLICY_NAMES = {"in_turn": "In turn (urgent first, then longest wait)",
                 "touch_fill": "Due patients first, then fill gaps with long cases"}
 RULE_NAMES = {"average": "To average case times, up to a fill %",
               "monte_carlo": "To a Monte Carlo overrun limit"}
+MODEL_NAMES = {"plugin": "Plug-in: each pair's own past cases",
+               "hierarchical": "Hierarchical: partial pooling",
+               "oracle": "True durations (reference only)"}
 DEFAULTS = {"specialty": "general_surgery", "n_surgeons": 6, "lists_per_surgeon": 1, "session_minutes": 480,
             "working_weeks": 42, "referrals": 24, "extra_lists": 0.5, "turnaround": 15, "policy": "in_turn",
-            "booking_rule": "average", "fill_pct": 100, "alpha_pct": 10, "overrun_tolerance": 30, "history_cases": 15}
+            "booking_rule": "average", "fill_pct": 100, "alpha_pct": 10, "duration_model": "plugin",
+            "overrun_tolerance": 30, "history_cases": 15}
 B_START = {**DEFAULTS, "booking_rule": "monte_carlo"}
 FIELDS = list(DEFAULTS)
 
@@ -57,6 +67,33 @@ for prefix, start in (("A", DEFAULTS), ("B", B_START)):
         st.session_state.setdefault(f"{prefix}_{f}", v)
 for k, v in {"seeds": 5, "target_weeks": 6, "threshold_pct": 95, "match_msg": ""}.items():
     st.session_state.setdefault(k, v)
+
+st.markdown(f"""
+<style>
+.block-container {{ padding-top: 2.4rem; padding-bottom: 4rem; max-width: 1320px; }}
+[data-testid="stMetric"] {{ background: #ffffff; border: 1px solid {GRID}; border-radius: 10px; padding: 0.75rem 1rem 0.8rem; }}
+[data-testid="stMetricLabel"] p {{ color: {NEUTRAL}; font-size: 0.86rem; }}
+.eyebrow {{ color: {NEUTRAL}; font-size: 0.78rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+            margin: 0.4rem 0 0.35rem; }}
+.lede {{ color: #3a3936; font-size: 1.02rem; margin: -0.4rem 0 0.2rem; max-width: 62rem; }}
+.badge {{ display: inline-block; font-size: 0.74rem; font-weight: 600; color: {NEUTRAL}; background: {BAND};
+          border: 1px solid {GRID}; border-radius: 999px; padding: 0.08rem 0.55rem; margin-left: 0.45rem;
+          vertical-align: middle; }}
+.scenario-line {{ color: #3a3936; font-size: 0.95rem; margin: 0.2rem 0 0.9rem; }}
+.kpi {{ background: #ffffff; border: 1px solid {GRID}; border-radius: 10px; padding: 0.8rem 1rem 0.85rem; height: 100%; }}
+.kpi .label {{ color: {NEUTRAL}; font-size: 0.86rem; line-height: 1.3; min-height: 2.2rem; }}
+.kpi .value {{ color: #1d1d1b; font-size: 2rem; font-weight: 600; line-height: 1.15; margin: 0.15rem 0 0.35rem;
+               font-variant-numeric: tabular-nums; }}
+.kpi .status {{ display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.82rem; color: #3a3936;
+                background: {BAND}; border-radius: 999px; padding: 0.12rem 0.55rem 0.12rem 0.3rem; }}
+.kpi .icon {{ display: inline-flex; width: 1.05rem; height: 1.05rem; border-radius: 50%; color: #fff;
+              font-size: 0.72rem; font-weight: 700; align-items: center; justify-content: center; }}
+.kpi .note {{ color: {MUTED}; font-size: 0.78rem; margin-top: 0.45rem; line-height: 1.35; }}
+.callout {{ background: #ffffff; border: 1px solid {GRID}; border-left: 4px solid {BLUE}; border-radius: 8px;
+            padding: 0.85rem 1.1rem; margin: 0.3rem 0 1rem; }}
+.chart-note {{ color: {MUTED}; font-size: 0.8rem; margin: -0.3rem 0 0.4rem; }}
+</style>
+""", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- cached computation
@@ -80,6 +117,22 @@ def demand_share(specialty: str, n_surgeons: int, lists_per_surgeon: int, sessio
     return implied_load(world, cfg)
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
+def duration_estimates(specialty: str, n_surgeons: int, history: float) -> tuple[pd.DataFrame, float, float, float]:
+    """For one synthetic hospital: each surgeon-procedure pair's own average, hierarchical estimate and truth."""
+    world = make_world(WorldConfig(specialty=specialty, n_surgeons=n_surgeons, history_median_cases=history),
+                       seed=seed_for(specialty, 0))
+    model = fit_hierarchical(world.history)
+    t = model.table.merge(world.true_params, on=["surgeon", "procedure"])
+    t["own_minutes"] = np.exp(t["ybar"])
+    t["hier_minutes"] = np.exp(t["mu_hat"])
+    t["true_minutes"] = np.exp(t["mu"])
+    t["prior_minutes"] = np.exp(t["prior_mean"])
+    sigma = float(model.sigma_by_proc.median())
+    k = sigma ** 2 / float(t["prior_var"].median())  # cases at which a pair's own data gets half the weight
+    return t, model.tau, sigma, k
+
+
 # ---------------------------------------------------------------- settings
 def scenario_from_state(p: str) -> Scenario:
     g = lambda f: st.session_state[f"{p}_{f}"]  # noqa: E731
@@ -89,7 +142,7 @@ def scenario_from_state(p: str) -> Scenario:
         working_weeks=int(g("working_weeks")), referrals_per_week=float(g("referrals")),
         extra_lists=float(g("extra_lists")),
         turnaround=float(g("turnaround")), policy=g("policy"), booking_rule=g("booking_rule"),
-        fill_fraction=g("fill_pct") / 100, alpha=g("alpha_pct") / 100,
+        fill_fraction=g("fill_pct") / 100, alpha=g("alpha_pct") / 100, duration_model=g("duration_model"),
         overrun_tolerance=float(g("overrun_tolerance")), target_weeks=int(st.session_state["target_weeks"]),
     )
 
@@ -114,7 +167,7 @@ def controls(p: str, two_columns: bool = False) -> None:
         share = demand_share(st.session_state[k("specialty")], st.session_state[k("n_surgeons")],
                              st.session_state[k("lists_per_surgeon")], st.session_state[k("session_minutes")],
                              st.session_state[k("working_weeks")], st.session_state[k("referrals")])
-        st.caption(f"These need about {100 * share:.0f}% of the theatre time available after leave "
+        st.caption(f"These need about **{100 * share:.0f}%** of the theatre time available after leave "
                    "(before any extra lists, at a 15-minute changeover).")
     with right, st.expander("Booking", expanded=True):
         st.radio("How full lists are booked", list(RULE_NAMES), format_func=RULE_NAMES.get, key=k("booking_rule"))
@@ -123,6 +176,9 @@ def controls(p: str, two_columns: bool = False) -> None:
         st.slider("Overrun limit per list (%)", 1, 50, key=k("alpha_pct"), disabled=avg,
                   help="A list is allowed only if the Monte Carlo estimate of its chance of overrunning "
                        "is at most this.")
+        st.selectbox("Planner's duration model", list(MODEL_NAMES), format_func=MODEL_NAMES.get,
+                     key=k("duration_model"), disabled=avg,
+                     help="How the Monte Carlo planner estimates case times. See the Duration model tab.")
         st.selectbox("Booking order", list(POLICIES), format_func=POLICY_NAMES.get, key=k("policy"))
         st.select_slider("Planner's past cases per surgeon and procedure", options=[3, 15, 50, 200],
                          key=k("history_cases"),
@@ -154,67 +210,9 @@ def match_b_to_a() -> None:
                                      f"against {100 * target:.1f}% for A.")
 
 
-# ---------------------------------------------------------------- charts
+# ---------------------------------------------------------------- formatting
 def pct(x: float) -> str:
     return f"{100 * x:.1f}%"
-
-
-def weekly_charts(res, target_weeks: int, warmup: int = 26):
-    wk = res.weekly.groupby("week")[["waiting", "waiting_within_6wk"]].mean().reset_index()
-    wk["week"] += 1
-    wk["within"] = 100 * wk["waiting_within_6wk"]
-    rule = alt.Chart(pd.DataFrame({"week": [warmup + 1]})).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(x="week:Q")
-    base = alt.Chart(wk).encode(x=alt.X("week:Q", title="Week (measured from week 27)"))
-    size = base.mark_line(color=BLUE, strokeWidth=2).encode(
-        y=alt.Y("waiting:Q", title="Patients waiting"),
-        tooltip=[alt.Tooltip("week:Q", title="Week"), alt.Tooltip("waiting:Q", title="Waiting", format=".0f")])
-    share = base.mark_line(color=BLUE, strokeWidth=2).encode(
-        y=alt.Y("within:Q", title=f"Still waiting within {target_weeks} weeks (%)", scale=alt.Scale(domain=[0, 100])),
-        tooltip=[alt.Tooltip("week:Q", title="Week"), alt.Tooltip("within:Q", title="Within target (%)", format=".1f")])
-    return (size + rule).properties(height=260), (share + rule).properties(height=260)
-
-
-def waits_chart(waits: np.ndarray, target_weeks: int):
-    weeks = np.floor(waits / 7).astype(int)
-    counts = pd.Series(weeks).value_counts().sort_index()
-    df = pd.DataFrame({"weeks": counts.index, "share": 100 * counts.values / counts.sum()})
-    df["group"] = np.where(df["weeks"] < target_weeks, f"Within {target_weeks} weeks", f"Over {target_weeks} weeks")
-    return alt.Chart(df).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
-        x=alt.X("weeks:O", title="Weeks waited before surgery"),
-        y=alt.Y("share:Q", title="Patients treated (%)"),
-        color=alt.Color("group:N", scale=alt.Scale(domain=[f"Within {target_weeks} weeks", f"Over {target_weeks} weeks"],
-                                                   range=[BLUE, ORANGE]), legend=alt.Legend(title=None, orient="top")),
-        tooltip=[alt.Tooltip("weeks:O", title="Weeks waited"), alt.Tooltip("share:Q", title="Patients (%)", format=".1f")],
-    ).properties(height=260)
-
-
-def needed_chart(curve: pd.DataFrame, threshold: float):
-    long = curve.melt(id_vars="extra_lists", value_vars=MEASURES, var_name="measure", value_name="value")
-    long["measure"] = long["measure"].map(MEASURE_LABELS)
-    long["value"] *= 100
-    lines = alt.Chart(long).mark_line(point=alt.OverlayMarkDef(size=40), strokeWidth=2).encode(
-        x=alt.X("extra_lists:Q", title="Extra lists per week"),
-        y=alt.Y("value:Q", title="Within target (%)", scale=alt.Scale(zero=False)),
-        color=alt.Color("measure:N", scale=alt.Scale(domain=list(MEASURE_LABELS.values()), range=[BLUE, ORANGE, AQUA]),
-                        legend=alt.Legend(title=None, orient="bottom", direction="vertical", labelLimit=400)),
-        tooltip=["measure:N", alt.Tooltip("extra_lists:Q", title="Extra lists/week"),
-                 alt.Tooltip("value:Q", title="Within target (%)", format=".1f")])
-    rule = alt.Chart(pd.DataFrame({"y": [100 * threshold]})).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(y="y:Q")
-    return (lines + rule).properties(height=320)
-
-
-def ab_needed_chart(ca: pd.DataFrame, cb: pd.DataFrame, threshold: float, target_weeks: int):
-    df = pd.concat([ca.assign(scenario="A"), cb.assign(scenario="B")])
-    df["value"] = 100 * df["cohort_within_6wk"]
-    lines = alt.Chart(df).mark_line(point=alt.OverlayMarkDef(size=40), strokeWidth=2).encode(
-        x=alt.X("extra_lists:Q", title="Extra lists per week"),
-        y=alt.Y("value:Q", title=f"Added to list: treated within {target_weeks} weeks (%)", scale=alt.Scale(zero=False)),
-        color=alt.Color("scenario:N", scale=alt.Scale(domain=["A", "B"], range=[BLUE, ORANGE]),
-                        legend=alt.Legend(title=None, orient="top")),
-        tooltip=["scenario:N", alt.Tooltip("extra_lists:Q", title="Extra lists/week"),
-                 alt.Tooltip("value:Q", title="Within target (%)", format=".1f")])
-    rule = alt.Chart(pd.DataFrame({"y": [100 * threshold]})).mark_rule(color=MUTED, strokeDash=[4, 4]).encode(y="y:Q")
-    return (lines + rule).properties(height=320)
 
 
 def fmt(v: float, dec: int, unit: str) -> str:
@@ -231,18 +229,185 @@ def signed(v: float, dec: int, suffix: str = "") -> str:
     return ("+" if v > 0 else "") + f"{v:,.{dec}f}" + suffix
 
 
+def target_card(label: str, value: float, threshold: float, note: str) -> str:
+    ok = value >= threshold
+    icon, colour, word = ("✓", GOOD, "Meets") if ok else ("✕", CRITICAL, "Misses")
+    shown = pct(value)
+    if not ok and round(100 * value, 1) >= 100 * threshold:  # e.g. 94.96% would display as 95.0%
+        shown = f"{100 * value:.2f}%"
+    return (f'<div class="kpi"><div class="label">{label}</div><div class="value">{shown}</div>'
+            f'<span class="status"><span class="icon" style="background:{colour}">{icon}</span>'
+            f'{word} the {threshold:.0%} target</span><div class="note">{note}</div></div>')
+
+
+def more_fewer(v: float) -> str:
+    return f"{abs(v):.1f} {'more' if v >= 0 else 'fewer'}"
+
+
+def eyebrow(text: str) -> None:
+    st.markdown(f'<div class="eyebrow">{text}</div>', unsafe_allow_html=True)
+
+
+def note(text: str) -> None:
+    st.markdown(f'<div class="chart-note">{text}</div>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------- charts
+def _warmup_band(warmup: int, y_bottom: float, y_scale: alt.Scale):
+    band = pd.DataFrame({"start": [0.5], "end": [warmup + 0.5], "y": [y_bottom], "label": ["Warm-up, not measured"]})
+    rect = alt.Chart(band).mark_rect(color=BAND).encode(x="start:Q", x2="end:Q")
+    text = alt.Chart(band).mark_text(align="left", baseline="bottom", dx=6, dy=-6, color=MUTED, fontSize=11).encode(
+        x="start:Q", y=alt.Y("y:Q", scale=y_scale), text="label:N")
+    return rect, text
+
+
+def weekly_charts(res, target_weeks: int, threshold: float, warmup: int = 26):
+    wk = res.weekly.groupby("week")[["waiting", "waiting_within_6wk"]].mean().reset_index()
+    wk["week"] += 1
+    wk["within"] = 100 * wk["waiting_within_6wk"]
+    lo = float(np.floor(min(100 * threshold - 10, wk["within"].min() - 2) / 10) * 10)
+    lo = max(0.0, lo)
+    x = alt.X("week:Q", title="Week", scale=alt.Scale(domain=[1, int(wk["week"].max())], nice=False))
+    rect, text = _warmup_band(warmup, 0, alt.Scale(domainMin=0))
+    size = alt.Chart(wk).mark_line(color=BLUE, strokeWidth=2).encode(
+        x=x, y=alt.Y("waiting:Q", title="Patients waiting", scale=alt.Scale(domainMin=0)),
+        tooltip=[alt.Tooltip("week:Q", title="Week"), alt.Tooltip("waiting:Q", title="Waiting", format=".0f")])
+    size_layers = rect + text + size
+    rect, text = _warmup_band(warmup, lo, alt.Scale(domain=[lo, 100]))
+    share = alt.Chart(wk).mark_line(color=BLUE, strokeWidth=2, clip=True).encode(
+        x=x, y=alt.Y("within:Q", title=f"Within {target_weeks} weeks (%)", scale=alt.Scale(domain=[lo, 100])),
+        tooltip=[alt.Tooltip("week:Q", title="Week"), alt.Tooltip("within:Q", title="Within target (%)", format=".1f")])
+    goal = pd.DataFrame({"y": [100 * threshold], "label": [f"Target {threshold:.0%}"]})
+    y_goal = alt.Y("y:Q", scale=alt.Scale(domain=[lo, 100]))
+    rule = alt.Chart(goal).mark_rule(color=NEUTRAL, strokeDash=[4, 4]).encode(y=y_goal)
+    rule_text = alt.Chart(goal).mark_text(align="left", dx=4, dy=12, color=NEUTRAL, fontSize=11).encode(
+        x=alt.datum(warmup + 1), y=y_goal, text="label:N")
+    return (size_layers.properties(height=250),
+            (rect + text + rule + rule_text + share).properties(height=250))
+
+
+def waits_chart(waits: np.ndarray, target_weeks: int):
+    weeks = np.floor(waits / 7).astype(int)
+    counts = pd.Series(weeks).value_counts().sort_index()
+    df = pd.DataFrame({"weeks": counts.index, "share": 100 * counts.values / counts.sum()})
+    within, over = f"Within {target_weeks} weeks", f"Over {target_weeks} weeks"
+    df["group"] = np.where(df["weeks"] < target_weeks, within, over)
+    return alt.Chart(df).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+        x=alt.X("weeks:O", title="Weeks waited before surgery", axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("share:Q", title="Patients treated (%)"),
+        color=alt.Color("group:N", scale=alt.Scale(domain=[within, over], range=[BLUE, ORANGE]),
+                        legend=alt.Legend(title=None, orient="top")),
+        tooltip=[alt.Tooltip("weeks:O", title="Weeks waited"), alt.Tooltip("share:Q", title="Patients (%)", format=".1f")],
+    ).properties(height=250)
+
+
+def needed_chart(curve: pd.DataFrame, threshold: float):
+    long = curve.melt(id_vars="extra_lists", value_vars=MEASURES, var_name="measure", value_name="value")
+    long["measure"] = long["measure"].map(MEASURE_LABELS)
+    long["value"] *= 100
+    lines = alt.Chart(long).mark_line(point=alt.OverlayMarkDef(size=40), strokeWidth=2).encode(
+        x=alt.X("extra_lists:Q", title="Extra lists per week"),
+        y=alt.Y("value:Q", title="Within target (%)", scale=alt.Scale(zero=False)),
+        color=alt.Color("measure:N", scale=alt.Scale(domain=list(MEASURE_LABELS.values()), range=[BLUE, ORANGE, AQUA]),
+                        legend=alt.Legend(title=None, orient="bottom", direction="vertical", labelLimit=400)),
+        tooltip=["measure:N", alt.Tooltip("extra_lists:Q", title="Extra lists/week"),
+                 alt.Tooltip("value:Q", title="Within target (%)", format=".1f")])
+    rule = alt.Chart(pd.DataFrame({"y": [100 * threshold]})).mark_rule(color=NEUTRAL, strokeDash=[4, 4]).encode(y="y:Q")
+    return (lines + rule).properties(height=300)
+
+
+def ab_needed_chart(ca: pd.DataFrame, cb: pd.DataFrame, threshold: float, target_weeks: int):
+    df = pd.concat([ca.assign(scenario="A"), cb.assign(scenario="B")])
+    df["value"] = 100 * df["cohort_within_6wk"]
+    lines = alt.Chart(df).mark_line(point=alt.OverlayMarkDef(size=40), strokeWidth=2).encode(
+        x=alt.X("extra_lists:Q", title="Extra lists per week"),
+        y=alt.Y("value:Q", title=f"Added to list: treated within {target_weeks} weeks (%)", scale=alt.Scale(zero=False)),
+        color=alt.Color("scenario:N", scale=alt.Scale(domain=["A", "B"], range=[BLUE, ORANGE]),
+                        legend=alt.Legend(title=None, orient="top")),
+        tooltip=["scenario:N", alt.Tooltip("extra_lists:Q", title="Extra lists/week"),
+                 alt.Tooltip("value:Q", title="Within target (%)", format=".1f")])
+    rule = alt.Chart(pd.DataFrame({"y": [100 * threshold]})).mark_rule(color=NEUTRAL, strokeDash=[4, 4]).encode(y="y:Q")
+    return (lines + rule).properties(height=300)
+
+
+EST_ORDER = ["Plug-in (own cases)", "Hierarchical", "True (hidden)"]
+TRUTH_SHAPE = "M-0.12,-1.1L0.12,-1.1L0.12,1.1L-0.12,1.1Z"  # a thin vertical bar
+
+
+def shrinkage_chart(t: pd.DataFrame, procedure: str):
+    d = t[t["procedure"] == procedure].copy()
+    d["surgeon_label"] = d["surgeon"] + "  (" + d["n"].astype(str) + " past " + np.where(d["n"] == 1, "case", "cases") + ")"
+    order = d.sort_values("true_minutes")["surgeon_label"].tolist()
+    long = d.melt(id_vars=["surgeon_label", "n", "weight"], value_vars=["own_minutes", "hier_minutes", "true_minutes"],
+                  var_name="estimate", value_name="minutes")
+    long["estimate"] = long["estimate"].map(dict(zip(["own_minutes", "hier_minutes", "true_minutes"], EST_ORDER)))
+    y = alt.Y("surgeon_label:N", sort=order, title=None, axis=alt.Axis(labelLimit=260))
+    pull = alt.Chart(d).mark_rule(color=MUTED, strokeWidth=1.5).encode(
+        y=y, x=alt.X("own_minutes:Q", title="Typical (median) case time, minutes", scale=alt.Scale(zero=False)),
+        x2="hier_minutes:Q")
+    pts = alt.Chart(long).mark_point(filled=True, size=120, opacity=1, strokeWidth=0).encode(
+        y=y, x="minutes:Q",
+        color=alt.Color("estimate:N", scale=alt.Scale(domain=EST_ORDER, range=[AQUA, YELLOW, NEUTRAL]),
+                        legend=alt.Legend(title=None, orient="top", labelLimit=320)),
+        shape=alt.Shape("estimate:N", scale=alt.Scale(domain=EST_ORDER, range=["circle", "diamond", TRUTH_SHAPE]),
+                        legend=None),
+        tooltip=["surgeon_label:N", "estimate:N", alt.Tooltip("minutes:Q", format=".0f"),
+                 alt.Tooltip("weight:Q", title="Weight on own data", format=".2f")])
+    return (pull + pts).properties(height=max(160, 46 * len(d)))
+
+
+def weight_chart(t: pd.DataFrame, k: float):
+    n = np.unique(np.round(np.geomspace(1, max(250, t["n"].max()), 80)))
+    curve = pd.DataFrame({"n": n, "w": n / (n + k)})
+    line = alt.Chart(curve).mark_line(color=NEUTRAL, strokeDash=[5, 4], strokeWidth=1.5).encode(
+        x=alt.X("n:Q", scale=alt.Scale(type="log"), title="Past cases for the surgeon and procedure (log scale)",
+                axis=alt.Axis(values=[1, 3, 10, 30, 100, 300], format="d")),
+        y=alt.Y("w:Q", title="Weight on the pair's own average", scale=alt.Scale(domain=[0, 1])))
+    pts = alt.Chart(t).mark_circle(size=55, color=BLUE, opacity=0.85).encode(
+        x="n:Q", y="weight:Q",
+        tooltip=["surgeon:N", "procedure:N", "n:Q", alt.Tooltip("weight:Q", format=".2f")])
+    half = pd.DataFrame({"n": [k], "w": [0.5], "label": [f"k ≈ {k:.0f} cases: half own data, half prior"]})
+    mark = alt.Chart(half).mark_point(shape="circle", size=70, filled=False, color=NEUTRAL, strokeWidth=1.5).encode(x="n:Q", y="w:Q")
+    lab = alt.Chart(half).mark_text(align="left", dx=10, dy=26, color=NEUTRAL, fontSize=11).encode(x="n:Q", y="w:Q", text="label:N")
+    return (line + pts + mark + lab).properties(height=300)
+
+
+SWEEP_NAMES = {"cc-plugin": "Plug-in", "cc-hier": "Hierarchical", "cc-oracle": "True durations"}
+
+
+def sweep_chart(sweep: pd.DataFrame):
+    d = sweep.assign(model=sweep["method"].map(SWEEP_NAMES), risk=100 * sweep["p90_list_risk"])
+    order = list(SWEEP_NAMES.values())
+    enc = dict(
+        x=alt.X("history_cases:O", title="Typical past cases per surgeon and procedure", axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("risk:Q", title="Realised P(overrun), riskiest 10% of lists (%)"),
+        color=alt.Color("model:N", scale=alt.Scale(domain=order, range=[AQUA, YELLOW, NEUTRAL]),
+                        legend=alt.Legend(title=None, orient="top", symbolType="circle")),
+        tooltip=["model:N", alt.Tooltip("history_cases:O", title="Past cases"),
+                 alt.Tooltip("risk:Q", title="Riskiest 10% of lists (%)", format=".1f")])
+    point = alt.OverlayMarkDef(size=60, filled=True)
+    models = alt.Chart(d[d.method != "cc-oracle"]).mark_line(point=point, strokeWidth=2).encode(**enc)
+    oracle = alt.Chart(d[d.method == "cc-oracle"]).mark_line(point=point, strokeWidth=2, strokeDash=[5, 4]).encode(**enc)
+    goal = pd.DataFrame({"y": [10.0], "label": ["Limit: 10%"]})
+    rule = alt.Chart(goal).mark_rule(color=MUTED, strokeDash=[2, 3]).encode(y="y:Q")
+    lab = alt.Chart(goal).mark_text(align="left", dx=4, dy=-7, color=MUTED, fontSize=11).encode(
+        x=alt.value(0), y="y:Q", text="label:N")
+    return (rule + lab + models + oracle).properties(height=300)
+
+
 # ---------------------------------------------------------------- page
 st.title("Theatre list booking simulator")
-st.caption("Simulates a year of elective theatre booking for one specialty, week by week, on synthetic data. "
-           "Every figure comes from invented, illustrative assumptions (see *Methodology*).")
+st.markdown('<div class="lede">A year of elective theatre booking for one specialty, simulated week by week: '
+            'who gets booked, how full lists are, what happens on the day, and how long patients wait. '
+            '<span class="badge">Synthetic data</span></div>', unsafe_allow_html=True)
 
 with st.sidebar:
-    st.header("Simulation")
+    st.subheader("Simulation")
     st.slider("Runs (synthetic hospitals)", 3, 20, key="seeds",
               help="More runs: smaller uncertainty, slower. Each run is 26 weeks' warm-up plus 52 measured weeks.")
     st.slider("Target: weeks from being added to surgery", 2, 18, key="target_weeks")
     st.slider("Target share treated within that time (%)", 80, 99, key="threshold_pct")
-    st.header("Scenario A")
+    st.subheader("Scenario A")
     controls("A")
 
 seeds = st.session_state["seeds"]
@@ -250,56 +415,71 @@ tw = st.session_state["target_weeks"]
 thr = st.session_state["threshold_pct"] / 100
 scn_a = scenario_from_state("A")
 
-tab_a, tab_cmp, tab_about = st.tabs(["Scenario A", "Compare A and B", "Methodology"])
+tab_a, tab_cmp, tab_dur, tab_about = st.tabs(["Scenario A", "Compare A and B", "Duration model", "Methodology"])
 
 with tab_a:
     with st.spinner("Simulating…"):
         ra = cached_run(asdict(scn_a), seeds)
     m = ra.per_seed.mean(numeric_only=True)
-    st.markdown(f"**{SPECIALTY_NAMES[scn_a.specialty]}**: {describe(scn_a)}.")
-    c = st.columns(4)
-    c[0].metric("Patients treated a year", f"{m['treated_per_year']:,.0f}")
-    c[1].metric("Still waiting: within target", pct(m["waiting_within_6wk"]),
-                help="Share of patients on the list at the end of each week who have waited no longer than the "
-                     "target. The way the national RTT standard is measured.")
-    c[2].metric("Treated: within target", pct(m["treated_within_6wk"]),
-                help="Of the patients operated on, the share who had waited no longer than the target.")
-    c[3].metric("Added: treated within target", pct(m["cohort_within_6wk"]),
-                help="Of everyone added to the list, the share operated on within the target. "
-                     "Treating patients out of turn can't flatter it.")
-    c = st.columns(4)
-    c[0].metric("Touch-time utilisation", pct(m["touch_utilisation"]),
-                help="Patient-in-theatre minutes inside the session, as a share of session time. "
-                     "Changeovers and overruns don't count.")
-    c[1].metric("Lists that overrun", pct(m["overrun_rate"]))
-    c[2].metric("Cancelled on the day, per 100 booked", f"{m['cancelled_per_100_booked']:.1f}")
-    c[3].metric("Median wait", f"{m['median_wait_days']:.0f} days")
+    st.markdown(f'<div class="scenario-line"><b>{SPECIALTY_NAMES[scn_a.specialty]}</b> · {scn_a.n_surgeons} surgeons · '
+                f'{scn_a.referrals_per_week:.0f} referrals a week · {describe(scn_a)}. Means over {seeds} runs.</div>',
+                unsafe_allow_html=True)
 
-    left, right = st.columns(2)
-    size_chart, share_chart = weekly_charts(ra, tw)
+    eyebrow(f"Waiting times: the {tw}-week target, three ways")
+    cols = st.columns(3)
+    cards = [
+        ("Still waiting: within target", m["waiting_within_6wk"],
+         "Share of the list at each week's end who have waited no longer than the target. How the national RTT "
+         "standard is measured."),
+        ("Treated: had waited no longer than target", m["treated_within_6wk"],
+         "Of the patients operated on, the share who had waited no longer than the target."),
+        ("Added to the list: treated within target", m["cohort_within_6wk"],
+         "Of everyone added, the share operated on within the target. Treating patients out of turn can't flatter it."),
+    ]
+    for c, (label, value, text) in zip(cols, cards):
+        c.markdown(target_card(label, value, thr, text), unsafe_allow_html=True)
+
+    eyebrow("Theatre use")
+    c = st.columns(5)
+    c[0].metric("Patients treated a year", f"{m['treated_per_year']:,.0f}")
+    c[1].metric("Touch-time utilisation", pct(m["touch_utilisation"]),
+                help="Patient-in-theatre minutes inside the session, as a share of session time. "
+                     "Changeovers and overruns don't count. The national target is 85%.")
+    c[2].metric("Lists that overrun", pct(m["overrun_rate"]))
+    c[3].metric("Cancelled on the day", f"{m['cancelled_per_100_booked']:.1f}",
+                help="Cases cancelled on the day per 100 booked, because the list was expected to run too late.")
+    c[4].metric("Median wait", f"{m['median_wait_days']:.0f} days")
+
+    st.write("")
+    left, right = st.columns(2, gap="large")
+    size_chart, share_chart = weekly_charts(ra, tw, thr)
     with left:
         st.subheader("Waiting list")
+        note("Patients waiting at the end of each week, averaged over runs.")
         st.altair_chart(size_chart, width="stretch")
     with right:
         st.subheader("Still waiting within target, by week")
+        note("The national-style measure, week by week.")
         st.altair_chart(share_chart, width="stretch")
-    left, right = st.columns(2)
+    left, right = st.columns(2, gap="large")
     with left:
         st.subheader("How long treated patients waited")
+        note("Patients operated on in the 52 measured weeks.")
         st.altair_chart(waits_chart(ra.waits, tw), width="stretch")
     with right:
         st.subheader("Extra lists needed")
-        if st.checkbox("Work out extra lists needed (about 5–10 seconds)", key="show_needed_a"):
+        if st.toggle("Work out extra lists needed (about 5–10 seconds)", key="show_needed_a"):
             with st.spinner("Sweeping extra lists…"):
                 na = cached_needed(asdict(scn_a), seeds, thr)
+            note(f"Each measure against extra lists a week; the dashed line is the {thr:.0%} target.")
             st.altair_chart(needed_chart(na.curve, thr), width="stretch")
             rows = [{"Measure": MEASURE_LABELS[k], "Per week": fmt(v, 2, ""),
                      "Per year": fmt(52 * v, 0, "")} for k, v in na.needed.items()]
-            st.dataframe(pd.DataFrame(rows), hide_index=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
             st.caption(f"Extra lists on top of the surgeons' own weekly lists (this sweep ignores the "
                        f"'Extra lists per week' setting). A dash means not reached within {na.max_extra:g} a week.")
         else:
-            st.caption("Sweeps 0 to 3 extra lists a week and finds where each measure reaches the target share.")
+            note("Sweeps 0 to 3 extra lists a week and finds where each measure reaches the target share.")
 
 with tab_cmp:
     st.markdown("Scenario B starts from the settings below. Change what you want to test. Both scenarios run on "
@@ -319,18 +499,19 @@ with tab_cmp:
     with st.spinner("Simulating both scenarios…"):
         ra = cached_run(asdict(scn_a), seeds)
         rb = cached_run(asdict(scn_b), seeds)
-    st.markdown(f"**A**: {SPECIALTY_NAMES[scn_a.specialty]}, {describe(scn_a)}.  \n"
-                f"**B**: {SPECIALTY_NAMES[scn_b.specialty]}, {describe(scn_b)}.")
     cmp = compare(ra, rb)
-    with_lists = st.checkbox("Include extra lists needed for both (about 10–20 seconds)", key="show_needed_ab")
+    with_lists = st.toggle("Include extra lists needed for both (about 10–20 seconds)", key="show_needed_ab")
     lists_cmp, na, nb = None, None, None
     if with_lists:
         with st.spinner("Sweeping extra lists for both scenarios…"):
             na = cached_needed(asdict(scn_a), seeds, thr)
             nb = cached_needed(asdict(scn_b), seeds, thr)
         lists_cmp = compare_lists_needed(na, nb)
-    st.subheader("In short")
-    st.markdown(headline(cmp, lists_cmp, tw, thr, scn_b.session_minutes, 3.0))
+    st.markdown(
+        f'<div class="callout"><div class="eyebrow" style="margin-top:0">In short</div>'
+        f'{headline(cmp, lists_cmp, tw, thr, scn_b.session_minutes, 3.0)}'
+        f'<div class="chart-note" style="margin:0.5rem 0 0">A: {SPECIALTY_NAMES[scn_a.specialty]}, {describe(scn_a)}.<br>'
+        f'B: {SPECIALTY_NAMES[scn_b.specialty]}, {describe(scn_b)}.</div></div>', unsafe_allow_html=True)
 
     st.subheader("Differences")
     table = pd.DataFrame({
@@ -354,12 +535,76 @@ with tab_cmp:
                                   for d, pm in zip(lists_cmp["difference"], lists_cmp["plus_minus"])],
         })
         table = pd.concat([table, extra], ignore_index=True)
-    st.dataframe(table, hide_index=True, height=38 + 35 * len(table))
+    st.dataframe(table, hide_index=True, height=38 + 35 * len(table), width="stretch")
     st.caption(f"Means over {seeds} runs. Differences are paired run by run; '±' is two standard errors of the "
                "paired difference, so a difference smaller than it isn't distinguishable from noise.")
     if na is not None:
         st.subheader("Extra lists needed: A and B")
         st.altair_chart(ab_needed_chart(na.curve, nb.curve, thr, tw), width="stretch")
+
+with tab_dur:
+    st.markdown(
+        "The Monte Carlo planner needs each surgeon's typical time for each procedure. The **plug-in** model uses "
+        "only that surgeon's own past cases of it, and treats the result as exact, even when it rests on one or two "
+        "cases. The **hierarchical** model blends the pair's own average with what you'd expect from the procedure "
+        "and the surgeon's speed on their other procedures, giving the pair's own data more weight the more of it "
+        "there is. It also carries the remaining uncertainty into the Monte Carlo draws, shared by all of that "
+        "surgeon's cases of the procedure on a list.")
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([1.2, 1.2, 2])
+        spec = c1.selectbox("Specialty", list(SPECIALTY_NAMES), format_func=SPECIALTY_NAMES.get,
+                            index=list(SPECIALTY_NAMES).index(scn_a.specialty), key="dur_specialty")
+        hist = c2.select_slider("Typical past cases per pair", options=[3, 15, 50, 200], value=15, key="dur_history")
+        est, tau, sigma, k = duration_estimates(spec, 6, float(hist))
+        procs = list(dict.fromkeys(est.sort_values("true_minutes")["procedure"]))
+        proc = c3.selectbox("Procedure", procs, format_func=lambda p: p.replace("_", " ").capitalize(),
+                            index=min(2, len(procs) - 1), key="dur_procedure")
+
+    left, right = st.columns([1.15, 1], gap="large")
+    with left:
+        st.subheader("One procedure, every surgeon")
+        note("Each grey line runs from the surgeon's own average to the hierarchical estimate: the pull towards "
+             "the prior. Pairs with few past cases are pulled furthest.")
+        st.altair_chart(shrinkage_chart(est, proc), width="stretch")
+    with right:
+        st.subheader("How much weight the pair's own data gets")
+        note(f"w = n / (n + k), with k = σ² / prior variance. σ ≈ {sigma:.2f} is how much single cases vary; "
+             f"the prior variance is τ² (τ ≈ {tau:.2f}, how far pairs differ from the prior) plus the uncertainty in the "
+             f"prior itself. All on the log scale. Each dot is one pair; the line uses typical values.")
+        st.altair_chart(weight_chart(est, k), width="stretch")
+
+    own_err = np.sqrt(np.mean(np.log(est["own_minutes"] / est["true_minutes"]) ** 2))
+    hier_err = np.sqrt(np.mean(np.log(est["hier_minutes"] / est["true_minutes"]) ** 2))
+    st.caption(f"In this synthetic hospital, the typical error in a pair's estimated time is {100 * own_err:.0f}% from "
+               f"its own cases alone and {100 * hier_err:.0f}% from the hierarchical model (root mean square, log scale).")
+
+    st.subheader("Does it help the planner hit its limit?")
+    if SWEEP_FILE.exists():
+        sweep = pd.read_csv(SWEEP_FILE)
+        left, right = st.columns([1.15, 1], gap="large")
+        with left:
+            note("Part 1 of the project: four weeks of lists for 5 surgeons, chance-constrained booking with a 10% "
+                 "overrun limit, scored on the true durations. Mean of 20 synthetic hospitals per point.")
+            st.altair_chart(sweep_chart(sweep), width="stretch")
+        with right:
+            tbl = sweep.assign(model=sweep["method"].map(SWEEP_NAMES)).pivot(
+                index="history_cases", columns="model", values="p90_list_risk")[list(SWEEP_NAMES.values())]
+            tbl = (100 * tbl).map(lambda v: f"{v:.1f}%").reset_index().rename(columns={"history_cases": "Past cases"})
+            st.caption("Riskiest 10% of lists: realised chance of overrunning, against a 10% limit")
+            st.dataframe(tbl, hide_index=True, width="stretch")
+            h15 = sweep[sweep.history_cases == 15].set_index("method")
+            st.markdown(
+                f"With a typical 15 past cases per pair, the plug-in planner's riskiest tenth of lists overrun "
+                f"{100 * h15.at['cc-plugin', 'p90_list_risk']:.0f}% of the time against a 10% limit. The hierarchical "
+                f"planner brings that to {100 * h15.at['cc-hier', 'p90_list_risk']:.0f}%, and a planner that knew "
+                f"the true durations would manage {100 * h15.at['cc-oracle', 'p90_list_risk']:.0f}%. Compared with "
+                f"booking to average at the same overrun rate, the plug-in planner books "
+                f"{more_fewer(h15.at['cc-plugin', 'extra_vs_avg_ratio'])} patients in four weeks and the hierarchical "
+                f"one {more_fewer(h15.at['cc-hier', 'extra_vs_avg_ratio'])}.")
+            st.caption("Try it in the year-long simulation: choose the Monte Carlo booking rule and a duration model "
+                       "under Booking in the sidebar.")
+    else:
+        st.caption("Run scripts/run_history_sweep.py to produce these results.")
 
 with tab_about:
     st.markdown(METHODOLOGY)

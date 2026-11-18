@@ -20,7 +20,9 @@ Each simulated week:
 Booking rules (how full a list may be):
 
 * ``monte_carlo`` a list is allowed only if the planner's Monte Carlo estimate of P(list overruns)
-                  is at most ``alpha``.
+                  is at most ``alpha``. The planner's duration model is ``plugin`` (pair estimates treated
+                  as exact), ``hierarchical`` (partial pooling, with the uncertainty carried into the
+                  draws) or ``oracle`` (the true durations, for reference).
 * ``average``     each case is assumed to take its surgeon's historical average time, and the list is
                   filled up to ``fill_fraction`` of the session. With ``in_turn`` this is plain
                   first-come-first-served booking.
@@ -49,12 +51,13 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .durations import LognormalPairModel, fit_plugin
+from .durations import LognormalPairModel, fit_hierarchical, fit_plugin
 from .evaluate import list_total_minutes
 from .synthetic import World
 
 POLICIES = ("in_turn", "ratio_fill", "touch_fill")
 BOOKING_RULES = ("monte_carlo", "average")
+DURATION_MODELS = ("plugin", "hierarchical", "oracle")
 
 
 @dataclass
@@ -79,6 +82,7 @@ class RollingConfig:
     policy: str = "in_turn"
     booking_rule: str = "monte_carlo"  # or "average"
     fill_fraction: float = 1.0  # for the "average" rule: fill lists to this share of the session
+    duration_model: str = "plugin"  # the Monte Carlo planner's model: "plugin", "hierarchical" or "oracle"
 
 
 @dataclass
@@ -164,7 +168,15 @@ def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
     truth = LognormalPairModel(world.true_params)
     fit = fit_plugin(world.history)
     true_minutes = truth.sample(df, 1, r_true)[:, 0]
-    plan = fit.model.sample(df, cfg.plan_samples, r_plan)
+    if cfg.duration_model == "plugin":
+        planner = fit.model
+    elif cfg.duration_model == "hierarchical":
+        planner = fit_hierarchical(world.history)
+    elif cfg.duration_model == "oracle":
+        planner = truth
+    else:
+        raise ValueError(f"unknown duration_model: {cfg.duration_model}")
+    plan = planner.sample(df, cfg.plan_samples, r_plan)
     return Patients(
         surgeon=df["surgeon_idx"].to_numpy(),
         procedure=df["procedure"].to_numpy(),
