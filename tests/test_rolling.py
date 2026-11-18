@@ -125,3 +125,51 @@ def test_more_extra_lists_clear_a_backlog_sooner():
     assert c.loc[2.0, "over_target_week_26"] < c.loc[0.0, "over_target_week_26"]
     by = rec.lists_to_meet_by(26)
     assert np.isnan(by) or 0 <= by <= 2.0
+
+
+# ---------------------------------------------------------------- describing today's list in more detail
+from theatre_sched.starting_list import CountsError, parse_counts, parse_weeks, summarise, to_scenario_bands  # noqa: E402
+
+
+def test_parse_weeks_formats():
+    assert parse_weeks("12-18") == (12, 18)
+    assert parse_weeks("12 to 18 weeks") == (12, 18)
+    assert parse_weeks("<6") == (0, 6)
+    assert parse_weeks("7") == (7, 8)
+    assert parse_weeks("52+") == (52, 78) and parse_weeks(">52") == (52, 78)
+    with pytest.raises(CountsError):
+        parse_weeks("soon")
+
+
+def test_parse_counts_reads_pasted_spreadsheet_blocks():
+    bands = parse_counts("Consultant\tWeeks\tPatients\nMr A\t0-6\t40\nMr A\t6-18\t20\nMs B\t0-6\t30\nMs B\t52+\t2")
+    assert [b.patients for b in bands] == [40, 20, 30, 2] and bands[0].surgeon == "Mr A"
+    s = summarise(bands, 6)
+    assert s["patients"] == 92 and s["over_target_pct"] == pytest.approx(100 * 22 / 92)
+    assert to_scenario_bands(bands, 3)[3] == (1, 52, 78, 2)
+    with pytest.raises(CountsError, match="at least 2"):
+        to_scenario_bands(bands, 1)
+    with pytest.raises(CountsError, match="Line 2"):
+        parse_counts("weeks,patients\n0-6,lots")
+    # a band straddling the target counts in proportion
+    assert summarise(parse_counts("4-8,100"), 6)["over_target_pct"] == pytest.approx(50)
+
+
+def test_counts_and_per_surgeon_lists_start_where_asked():
+    bands = to_scenario_bands(parse_counts("Mr A,0-6,40\nMr A,20-30,20\nMs B,0-6,10"), 4)
+    r = run(Scenario(referrals_per_week=24, n_surgeons=4, start_waiting=70, start_bands=bands, horizon_weeks=26), 1)
+    p = r.per_seed.iloc[0]
+    assert p["waiting_start"] == 70 and p["over_target_start"] == 20
+    assert 7 * 20 < p["longest_wait_days_start"] <= 7 * 30 + 1
+    by = ((60, 50, 30), (10, 0, 7), (10, 0, 7), (10, 0, 7))
+    q = run(Scenario(referrals_per_week=24, n_surgeons=4, start_waiting=90, start_by_surgeon=by, horizon_weeks=26), 1)
+    assert q.per_seed.iloc[0]["waiting_start"] == 90
+    assert 20 <= q.per_seed.iloc[0]["over_target_start"] <= 40  # about half of S1's 60
+
+
+def test_a_backlog_on_one_surgeon_clears_more_slowly_than_the_same_backlog_shared():
+    kw = dict(referrals_per_week=24, extra_lists=0.5, start_waiting=200, horizon_weeks=52)
+    shared = run(Scenario(**kw, start_by_surgeon=((34, 35, 30),) * 2 + ((33, 35, 30),) * 4), 3).per_seed
+    one = run(Scenario(**kw, start_by_surgeon=((100, 70, 30),) + ((20, 0, 7),) * 5), 3).per_seed
+    assert one["over_target_week_13"].mean() > shared["over_target_week_13"].mean()
+    assert one["weeks_to_treat_start_list"].mean() > shared["weeks_to_treat_start_list"].mean()

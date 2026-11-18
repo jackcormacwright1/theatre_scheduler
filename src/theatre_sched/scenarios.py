@@ -67,6 +67,9 @@ class Scenario:
     start_waiting: int | None = None
     start_over_target_pct: float = 30.0  # % of today's list already past the target
     start_longest_weeks: float = 26.0  # the longest wait on today's list
+    # Optional detail, replacing the three totals above (start_waiting must still be set, to the total):
+    start_by_surgeon: tuple[tuple[int, float, float], ...] | None = None  # (patients, % over target, longest weeks)
+    start_bands: tuple[tuple[int, float, float, int], ...] | None = None  # (surgeon index or -1, lo weeks, hi weeks, patients)
     horizon_weeks: int = 52  # weeks simulated from today
 
     @property
@@ -89,7 +92,11 @@ class Scenario:
             target_share=self.target_share,
             **({"weeks_warmup": 0, "weeks_measured": self.horizon_weeks, "start_waiting": int(self.start_waiting),
                 "start_over_target_share": self.start_over_target_pct / 100,
-                "start_longest_days": 7 * self.start_longest_weeks} if self.from_today else {}),
+                "start_longest_days": 7 * self.start_longest_weeks,
+                "start_by_surgeon": tuple((int(n), pct / 100, 7 * longest) for n, pct, longest in self.start_by_surgeon)
+                if self.start_by_surgeon else None,
+                "start_bands": tuple((int(k), 7 * lo, 7 * hi, int(n)) for k, lo, hi, n in self.start_bands)
+                if self.start_bands else None} if self.from_today else {}),
         )
 
 
@@ -332,11 +339,34 @@ def match_overrun(target_rate: float, scn: Scenario, seeds: int = 5) -> tuple[Sc
     return best, best_rate
 
 
+def start_summary(scn: Scenario) -> dict:
+    """Patients, % already past target and longest wait (weeks) on today's list, however it was described."""
+    t = scn.target_weeks
+    if scn.start_bands:
+        total = sum(n for _, _, _, n in scn.start_bands)
+        over = sum(n if lo >= t else (n * (hi - t) / (hi - lo) if hi > t else 0) for _, lo, hi, n in scn.start_bands)
+        longest = max(hi for _, _, hi, n in scn.start_bands if n > 0)
+        how = "counts by weeks waited"
+    elif scn.start_by_surgeon:
+        total = sum(n for n, _, _ in scn.start_by_surgeon)
+        over = sum(n * pct / 100 for n, pct, _ in scn.start_by_surgeon)
+        longest = max(lw for n, _, lw in scn.start_by_surgeon if n > 0) if total else 0
+        how = "by surgeon"
+    else:
+        total, over, longest, how = scn.start_waiting or 0, (scn.start_waiting or 0) * scn.start_over_target_pct / 100, \
+            scn.start_longest_weeks, "totals"
+    return {"patients": int(total), "over_target_pct": 100 * over / total if total else 0.0,
+            "longest_weeks": float(longest), "described": how}
+
+
 def describe_start(scn: Scenario) -> str:
     if not scn.from_today:
         return "a settled waiting list (after a 26-week warm-up)"
-    return (f"today's list of {scn.start_waiting:,} patients, {scn.start_over_target_pct:.0f}% already past "
-            f"{scn.target_weeks} weeks and the longest at {scn.start_longest_weeks:.0f} weeks")
+    s = start_summary(scn)
+    detail = {"totals": "", "by surgeon": ", set surgeon by surgeon",
+              "counts by weeks waited": ", from counts by weeks waited"}[s["described"]]
+    return (f"today's list of {s['patients']:,} patients, about {s['over_target_pct']:.0f}% already past "
+            f"{scn.target_weeks} weeks and the longest at {s['longest_weeks']:.0f} weeks{detail}")
 
 
 def describe(scn: Scenario) -> str:

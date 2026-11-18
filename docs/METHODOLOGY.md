@@ -326,14 +326,20 @@ The reported figure is the mean across seeds. If any seed doesn't reach 95% with
 
 A settled simulation answers "where do these settings lead?", but deliberately forgets where the list starts. A service with a backlog needs the other question: **given the list we have now, what happens from here?** Setting a starting list answers it.
 
-**The starting list** is described by three numbers: $S$, the patients waiting now (whole specialty); $q$, the share who have already waited longer than the target $T$; and $D$, the longest wait now. The $S$ patients are shared between the surgeons at random with equal chances (a multinomial draw), and each gets a procedure and urgency flag as new referrals do. Their waits so far are drawn as follows:
+**The starting list** can be described in three ways, from least to most detail.
+
+*Totals.* Three numbers: $S$, the patients waiting now (whole specialty); $q$, the share who have already waited longer than the target $T$; and $D$, the longest wait now. The $S$ patients are shared evenly between the surgeons (any remainder going to the first surgeons), and each gets a procedure and urgency flag as new referrals do. Their waits so far are drawn as follows:
 
 - with probability $1 - q$, the wait is spread evenly between 1 day and $T$, as it would be for a list fed by steady referrals;
 - with probability $q$, the wait is beyond the target, thinning out evenly to nobody at the longest wait: a **triangular** density on $(T, D]$, highest at $T$. It is sampled by inverting its cumulative distribution: with $u$ uniform on $(0, 1)$, $\text{wait} = T + (D - T)\,(1 - \sqrt{1 - u})$.
 
 > **Worked example.** $T = 42$ days and $D = 210$ days (30 weeks). A patient over target with $u = 0.5$ has waited $42 + 168 \times (1 - \sqrt{0.5}) = 42 + 168 \times 0.293 = 91$ days, 13 weeks. Half of the over-target patients have waited less than that, because the density is highest just past the target. The mean over-target wait is a third of the way from $T$ to $D$: $42 + 168/3 = 98$ days.
 
-The starting list uses its own random number stream, so changing it leaves the new referrals unchanged, and two scenarios with the same starting settings start from exactly the same patients.
+*Surgeon by surgeon.* The same three numbers for each surgeon, $S_k$, $q_k$ and $D_k$, drawn the same way. Because each surgeon only treats their own list, this is what shows the effect of a backlog concentrated on one or two consultants.
+
+*Counts by weeks waited*, as in a waiting-list extract: lines of `weeks, patients`, or `surgeon, weeks, patients`, pasted or loaded from a CSV ([`starting_list.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/src/theatre_sched/starting_list.py)). Weeks can be a band (`12-18`, meaning at least 12 and under 18), a whole number of weeks (`7`, meaning 7 to 8) or open-ended (`52+`, taken as 52 to 78 weeks). Within a band, waits are spread evenly. Surgeon names are matched, in the order they first appear, to the simulated surgeons S1, S2 and so on; any simulated surgeons left over start with an empty list. Without a surgeon column, each band is shared between the surgeons at random with equal chances. The share past the target, shown when the counts are read, counts a band that straddles the target in proportion: with $T$ = 6 weeks, half of a 4–8 week band counts as past it.
+
+Whichever way it's described, the starting list uses its own random number stream, so changing it leaves the new referrals unchanged, and two scenarios with the same starting settings start from exactly the same patients.
 
 **Measures from today.** As well as the measures in section 6.6 (now averaged over every week from today), the run reports:
 
@@ -351,7 +357,10 @@ If the run never meets the target at $E_{k-1}$, $E^{\ast} = E_k$. The reported f
 
 > **Worked example.** In one run, the target is met at week 35 with 0.25 extra lists a week and at week 24 with 0.5. To meet it by week 26: $E^{\ast} = 0.25 + \frac{35 - 26}{35 - 24} \times 0.25 = 0.25 + 0.818 \times 0.25 = 0.45$ extra lists a week.
 
-**A finding this view brings out.** Booking in turn clears the longest waiters first, so everyone on today's list is treated well before the target is met: new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages; 200 patients waiting, 35% over 6 weeks, the longest at 30), today's list is all treated by about week 11, but 95% within 6 weeks isn't held until about week 27, ranging from week 18 to 39 across five runs.
+**Findings this view brings out.**
+
+- Booking in turn clears the longest waiters first, so everyone on today's list is treated well before the target is met: new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages; 200 patients waiting, 35% over 6 weeks, the longest at 30), today's list is all treated by about week 10, but 95% within 6 weeks isn't held until about week 17, ranging from week 11 to 21 across five runs.
+- Where the backlog sits matters. Putting 100 of the 200 patients on one surgeon (70% of them past 6 weeks) and 20 recent referrals on each of the others leaves about 31 patients over target after 13 weeks, against 13 when the same backlog is shared evenly. The target is met at about week 23 rather than 17, and today's list takes until about week 14 to clear rather than week 10 (five runs each).
 
 ---
 
@@ -377,13 +386,13 @@ Code: [`scenarios.py`](https://github.com/jackcormacwright1/theatre_scheduler/bl
 
 ## 8. Checking the work
 
-Code: [`tests/`](https://github.com/jackcormacwright1/theatre_scheduler/tree/main/tests) (38 automated tests, run with `pytest`)
+Code: [`tests/`](https://github.com/jackcormacwright1/theatre_scheduler/tree/main/tests) (42 automated tests, run with `pytest`)
 
 - **The Monte Carlo against a known answer.** For a single lognormal case, the simulated overrun probability matches the exact tail probability within 4 Monte Carlo standard errors.
 - **Arithmetic of lists.** Changeovers are counted between cases only. Fixed durations give certain outcomes. Touch time excludes changeovers and overrun (the worked example in section 4 is a test).
 - **The duration fit.** With plenty of data, the plug-in estimates recover the true parameters. Sparse pairs borrow the pooled spread.
 - **The hierarchical model.** With plenty of data it agrees with the plug-in estimates. A pair with one unusual case is pulled towards the prior, lands between its own average and the prior, and keeps a wide posterior. Draws for two patients of the same pair are correlated, and draws for different pairs aren't. A pair with no history gets the prior. Across synthetic worlds, $\hat\tau$ recovers the true surgeon–procedure deviation (0.08), and is larger without the surgeon effect, as it should be. Choosing a duration model leaves the patients and their true case times unchanged.
-- **Starting from today's list.** The starting waits have the share over target asked for, none beyond the longest wait, and the triangular mean beyond the target. The week the target is met needs 4 weeks in a row (a single good week doesn't count). A run starts with exactly the list asked for, and settled runs give exactly the same results as before the option was added. More extra lists leave fewer patients over target after 26 weeks.
+- **Starting from today's list.** The starting waits have the share over target asked for, none beyond the longest wait, and the triangular mean beyond the target. The week the target is met needs 4 weeks in a row (a single good week doesn't count). A run starts with exactly the list asked for, however it is described, and settled runs give exactly the same results as before the option was added. More extra lists leave fewer patients over target after 26 weeks, and a backlog concentrated on one surgeon clears more slowly than the same backlog shared. Pasted counts are read in the formats listed above, a band straddling the target counts in proportion, and an extract with more surgeons than the scenario is refused with a message saying how many are needed.
 - **Schedulers.** No patient is booked twice, or on another surgeon's list. Every chance-constrained list meets its limit on the planning draws, and booking to averages respects the fill fraction.
 - **The year-long simulation.**
   - No patient is operated on before being added.
@@ -417,7 +426,8 @@ Three investigations during development changed the model or its interpretation:
 | 6 weeks from the decision to operate stands in for 18 weeks from referral | A working premise | Doesn't model outpatient or diagnostic waits |
 | The cancellation rule uses the expected finish with a 30-minute tolerance | A plausible operational rule | Different tolerances trade cancellations against overtime |
 | Booking happens weekly with patients eligible the week after being added | Represents pre-assessment and notice | Sets a floor of about 1–2 weeks on waits |
-| Today's list is shared evenly between surgeons, with an even-then-triangular wait profile | Three numbers are enough to describe a list | A real backlog concentrated on one or two surgeons would take longer to clear than modelled, because each surgeon only treats their own patients |
+| Unless set surgeon by surgeon, or by surgeon in pasted counts, today's list is shared evenly between surgeons | Three numbers are often all that's to hand | A real backlog concentrated on one or two surgeons takes longer to clear: set it surgeon by surgeon to see how much |
+| Within a band of pasted counts, and within the target in the totals description, waits are spread evenly | Extracts give counts by band, not exact dates | Small effect on when patients pass the target; narrower bands remove it |
 
 ---
 

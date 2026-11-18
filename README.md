@@ -204,7 +204,7 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
   - specialty, number of surgeons, lists per surgeon and list length;
   - operating weeks a year and extra lists per week;
   - demand, as referrals a week for the whole specialty, shared between the surgeons, so adding surgeons adds capacity rather than demand;
-  - where to start: **today's waiting list** (its size, the share already past the target and the longest wait, and how many weeks to simulate) or a settled list after a warm-up, as in Part 2;
+  - where to start: **today's waiting list** or a settled list after a warm-up, as in Part 2. Today's list can be described by totals (its size, the share already past the target and the longest wait), surgeon by surgeon, or as **counts by weeks waited pasted from a waiting-list extract** (or loaded from a CSV), with or without a surgeon column; plus how many weeks to simulate;
   - how full lists are booked (to average times at a chosen fill %, or to a Monte Carlo overrun limit), and the Monte Carlo planner's duration model;
   - booking order and how much history the planner has;
   - changeover time and the on-the-day cancellation rule;
@@ -228,7 +228,10 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
 
 Part 2 deliberately forgets where the list starts: a 26-week warm-up lets it settle, so the results describe where the settings lead. A service with a backlog needs the other question: given the list we have now, what happens from here? The dashboard can start from a list of a given size and wait profile and measure every week from today ([methodology, section 6.8](docs/METHODOLOGY.md)).
 
-This brings out something the settled view hides. Booking in turn clears the longest waiters first, so new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages, and 200 patients waiting today, 35% of them over 6 weeks), everyone on today's list is treated by about week 11, but 95% within 6 weeks isn't held until about week 27 (week 18 to 39 across five runs). One extra list a week instead of half brings that forward by 15 weeks (± 8), to about week 11. Meeting the target by week 26 needs about 0.45 extra lists a week, and by week 13 about 0.9.
+This brings out two things the settled view hides.
+
+- **The backlog clears before the target is met.** Booking in turn clears the longest waiters first, so new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages, and 200 patients waiting today, 35% of them over 6 weeks), everyone on today's list is treated by about week 10, but 95% within 6 weeks isn't held until about week 17 (week 11 to 21 across five runs). One extra list a week instead of half brings that forward by 5.6 weeks (± 2.1). Meeting the target by week 26 needs about 0.35 extra lists a week, and by week 13 about 0.8.
+- **Where the backlog sits matters.** Put half of those 200 patients on one surgeon, most of them past 6 weeks, and after 13 weeks about 31 patients are still over target rather than 13, and the target is met at about week 23 rather than 17. Each surgeon only treats their own list, so a concentrated backlog can't be shared out (pooling lists is a next step for Part 2).
 
 In the year-long simulation, the better duration model mainly shows up as fewer overruns and on-the-day cancellations rather than shorter waits. In general surgery at 24 referrals a week and a 10% limit, lists overran 3.1% of the time against 3.9% with the plug-in model (10 runs; 4.8% against 5.8% with 3 past cases per pair). The differences in waiting times were within the noise, because at that demand the waits are set by capacity rather than by how cautiously lists are booked.
 
@@ -270,7 +273,7 @@ To deploy it on Streamlit Community Cloud:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                                   # 38 tests
+pytest                                   # 42 tests
 python scripts/run_experiment.py         # Part 1: about a minute; writes results/
 python scripts/run_experiment.py --history-cases 200 --out results/history200
 python scripts/run_history_sweep.py      # Part 1 with 3, 15, 50 and 200 past cases per pair: about 4 minutes
@@ -288,7 +291,8 @@ src/theatre_sched/
   evaluate.py     Monte Carlo scoring of lists and schedules, including touch-time utilisation
   schedule.py     Part 1: weights, book-to-average baselines, chance-constrained search
   rolling.py      Part 2: week-by-week simulation, booking rules and policies, the three 6-week measures
-  scenarios.py    Part 3: run a scenario, paired A-vs-B comparison, lists-needed sweep, overrun matching
+  scenarios.py    Part 3: run a scenario, paired A-vs-B comparison, lists-needed and recovery sweeps, overrun matching
+  starting_list.py  today's waiting list: reading counts by weeks waited from an extract
 app.py                      Part 3: the Streamlit dashboard
 requirements.txt            dependencies for Streamlit Community Cloud
 .streamlit/config.toml      the dashboard's theme

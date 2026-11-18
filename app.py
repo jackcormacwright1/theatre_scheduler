@@ -28,12 +28,14 @@ from theatre_sched.scenarios import (  # noqa: E402
     describe,
     describe_start,
     headline,
+    start_summary,
     lists_needed,
     match_overrun,
     recovery_curve,
     run,
     seed_for,
 )
+from theatre_sched.starting_list import CountsError, parse_counts, summarise, to_scenario_bands  # noqa: E402
 from theatre_sched.synthetic import WorldConfig, make_world  # noqa: E402
 
 st.set_page_config(page_title="Theatre list booking simulator", page_icon="🩺", layout="wide")
@@ -48,6 +50,8 @@ BLUE, ORANGE, AQUA, YELLOW = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
 NEUTRAL, MUTED, GRID, BAND = "#52514e", "#898781", "#e1e0d9", "#f0efea"
 GOOD, CRITICAL = "#0ca30c", "#d03b3b"
 START_NAMES = {"today": "Today's waiting list", "settled": "A settled list (steady state)"}
+DESCRIBE_NAMES = {"totals": "Totals", "surgeon": "Surgeon by surgeon", "counts": "Counts by weeks waited"}
+EXAMPLE_COUNTS = "weeks,patients\n0-6,130\n6-12,40\n12-18,18\n18-26,9\n26-40,3"
 SPECIALTY_NAMES = {"general_surgery": "General surgery", "orthopaedics": "Orthopaedics",
                    "gynaecology": "Gynaecology", "ent": "ENT"}
 POLICY_NAMES = {"in_turn": "In turn (urgent first, then longest wait)",
@@ -62,7 +66,8 @@ DEFAULTS = {"specialty": "general_surgery", "n_surgeons": 6, "lists_per_surgeon"
             "working_weeks": 42, "referrals": 24, "extra_lists": 0.5, "turnaround": 15, "policy": "in_turn",
             "booking_rule": "average", "fill_pct": 100, "alpha_pct": 10, "duration_model": "plugin",
             "overrun_tolerance": 30, "history_cases": 15,
-            "start_mode": "today", "start_waiting": 200, "start_over_pct": 35, "start_longest": 30, "horizon": 52}
+            "start_mode": "today", "start_describe": "totals", "start_waiting": 200, "start_over_pct": 35,
+            "start_longest": 30, "start_text": EXAMPLE_COUNTS, "horizon": 52}
 B_START = {**DEFAULTS, "booking_rule": "monte_carlo"}
 FIELDS = list(DEFAULTS)
 
@@ -96,6 +101,7 @@ st.markdown(f"""
 .callout {{ background: #ffffff; border: 1px solid {GRID}; border-left: 4px solid {BLUE}; border-radius: 8px;
             padding: 0.85rem 1.1rem; margin: 0.3rem 0 1rem; }}
 .chart-note {{ color: {MUTED}; font-size: 0.8rem; margin: -0.3rem 0 0.4rem; }}
+section[data-testid="stSidebar"][data-collapsed="false"] {{ min-width: 380px; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -162,10 +168,50 @@ def scenario_from_state(p: str) -> Scenario:
         fill_fraction=g("fill_pct") / 100, alpha=g("alpha_pct") / 100, duration_model=g("duration_model"),
         overrun_tolerance=float(g("overrun_tolerance")), target_weeks=int(st.session_state["target_weeks"]),
         target_share=st.session_state["threshold_pct"] / 100,
-        start_waiting=int(g("start_waiting")) if g("start_mode") == "today" else None,
-        start_over_target_pct=float(g("start_over_pct")), start_longest_weeks=float(g("start_longest")),
         horizon_weeks=int(g("horizon")),
+        **start_fields(p),
     )
+
+
+def surgeon_rows(p: str) -> pd.DataFrame:
+    """The by-surgeon starting list as edited (or, before any edit, the totals split evenly)."""
+    n = int(st.session_state[f"{p}_n_surgeons"])
+    base = st.session_state.get(f"{p}_surgeon_base")
+    if base is None or len(base) != n:
+        total, over, longest = (int(st.session_state[f"{p}_{f}"]) for f in ("start_waiting", "start_over_pct", "start_longest"))
+        counts = [total // n + (1 if i < total % n else 0) for i in range(n)]
+        base = pd.DataFrame({"Surgeon": [f"S{i + 1}" for i in range(n)], "Waiting": counts,
+                             "% over": [over] * n, "Longest": [longest] * n})
+        st.session_state[f"{p}_surgeon_base"] = base
+        st.session_state.pop(f"{p}_surgeon_editor", None)
+        st.session_state.pop(f"{p}_surgeon_edited", None)
+    return st.session_state.get(f"{p}_surgeon_edited", base)
+
+
+def reset_surgeon_rows(p: str) -> None:
+    for key in ("surgeon_base", "surgeon_edited", "surgeon_editor"):
+        st.session_state.pop(f"{p}_{key}", None)
+
+
+def start_fields(p: str) -> dict:
+    """The Scenario fields describing where the run starts, from scenario p's settings."""
+    g = lambda f: st.session_state[f"{p}_{f}"]  # noqa: E731
+    if g("start_mode") != "today":
+        return {"start_waiting": None}
+    common = {"start_over_target_pct": float(g("start_over_pct")), "start_longest_weeks": float(g("start_longest"))}
+    how = g("start_describe")
+    if how == "surgeon":
+        rows = surgeon_rows(p)
+        by = tuple((int(r["Waiting"]), float(r["% over"]), float(r["Longest"])) for _, r in rows.iterrows())
+        if sum(n for n, _, _ in by) > 0:
+            return {**common, "start_waiting": sum(n for n, _, _ in by), "start_by_surgeon": by}
+    elif how == "counts":
+        try:
+            bands = to_scenario_bands(parse_counts(g("start_text")), int(g("n_surgeons")))
+            return {**common, "start_waiting": sum(b[3] for b in bands), "start_bands": bands}
+        except CountsError:
+            pass  # the error is shown by the controls; fall back to the totals
+    return {**common, "start_waiting": int(g("start_waiting"))}
 
 
 def controls(p: str, two_columns: bool = False) -> None:
@@ -192,18 +238,62 @@ def controls(p: str, two_columns: bool = False) -> None:
                    "(before any extra lists, at a 15-minute changeover).")
     with left, st.expander("Starting waiting list", expanded=True):
         st.radio("Start from", list(START_NAMES), format_func=START_NAMES.get, key=k("start_mode"), horizontal=True,
-                 help="Today's list: simulate forward from a list of the size and wait profile you set, measuring "
-                      "every week. Settled: start small and run a 26-week warm-up first, so the results show "
-                      "where these settings end up whatever the start.")
+                 help="Today's list: simulate forward from the list you describe, measuring every week. Settled: "
+                      "start small and run a 26-week warm-up first, so the results show where these settings end up "
+                      "whatever the start.")
         settled = st.session_state[k("start_mode")] == "settled"
         tw_now = int(st.session_state["target_weeks"])
-        st.slider("Patients waiting now", 0, 2000, step=10, key=k("start_waiting"), disabled=settled,
-                  help="The whole specialty's list, shared evenly between the surgeons.")
-        st.slider(f"Already waited more than {tw_now} weeks (%)", 0, 90, key=k("start_over_pct"), disabled=settled)
+        st.radio("Describe today's list by", list(DESCRIBE_NAMES), format_func=DESCRIBE_NAMES.get,
+                 key=k("start_describe"), disabled=settled)
+        how = st.session_state[k("start_describe")]
         if st.session_state[k("start_longest")] <= tw_now:
             st.session_state[k("start_longest")] = tw_now + 1
-        st.slider("Longest wait now (weeks)", tw_now + 1, 104, key=k("start_longest"), disabled=settled,
-                  help="Waits beyond the target thin out evenly up to this.")
+        if how == "totals" or settled:
+            st.slider("Patients waiting now", 0, 2000, step=10, key=k("start_waiting"), disabled=settled,
+                      help="The whole specialty's list, shared evenly between the surgeons.")
+            st.slider(f"Already waited more than {tw_now} weeks (%)", 0, 90, key=k("start_over_pct"), disabled=settled)
+            st.slider("Longest wait now (weeks)", tw_now + 1, 104, key=k("start_longest"), disabled=settled,
+                      help="Waits beyond the target thin out evenly up to this.")
+        elif how == "surgeon":
+            base = surgeon_rows(p)
+            edited = st.data_editor(
+                st.session_state[f"{p}_surgeon_base"], key=f"{p}_surgeon_editor", hide_index=True, width="stretch",
+                disabled=["Surgeon"],
+                column_config={
+                    "Surgeon": st.column_config.TextColumn(width=58),
+                    "Waiting": st.column_config.NumberColumn(min_value=0, max_value=2000, step=1, format="%d", width=74),
+                    "% over": st.column_config.NumberColumn(min_value=0, max_value=100, step=1, format="%d", width=74,
+                                                            help=f"% already waited more than {tw_now} weeks"),
+                    "Longest": st.column_config.NumberColumn(min_value=tw_now + 1, max_value=104, step=1, format="%d",
+                                                                 width=80, help="Longest wait now, in weeks"),
+                })
+            st.session_state[f"{p}_surgeon_edited"] = edited
+            st.caption(f"{int(edited['Waiting'].sum()):,} patients in all. Edit any cell; each surgeon only treats "
+                       "their own list.")
+            st.button("Reset to the totals, split evenly", key=f"{p}_reset_surgeons", on_click=reset_surgeon_rows,
+                      args=(p,), help="Uses the totals from the 'Totals' option.")
+            del base
+        else:
+            st.file_uploader("Load a CSV", type=["csv", "txt", "tsv"], key=k("counts_file"),
+                             on_change=load_counts_file, args=(p,))
+            st.text_area("…or paste counts", key=k("start_text"), height=150,
+                         help="One line per band: 'weeks, patients' or 'surgeon, weeks, patients'. Weeks can be a band "
+                              "(12-18), a whole number of weeks (7), or open-ended (52+, taken as 52 to 78). A header "
+                              "line is optional, and a block copied from a spreadsheet works.")
+            try:
+                bands = parse_counts(st.session_state[k("start_text")])
+                to_scenario_bands(bands, int(st.session_state[k("n_surgeons")]))
+                sm = summarise(bands, tw_now)
+                names = {b.surgeon for b in bands if b.surgeon}
+                st.caption(f"Read **{sm['patients']:,} patients**, about {sm['over_target_pct']:.0f}% past {tw_now} weeks, "
+                           f"the longest under {sm['longest_weeks']:.0f} weeks"
+                           + (f", for {len(names)} surgeons (matched in order to S1, S2, …)" if names
+                              else ", shared evenly between the surgeons.")
+                           + (f"; S{len(names) + 1} onwards start with an empty list." if names and
+                              len(names) < int(st.session_state[k("n_surgeons")]) else ("." if names else ""))
+                           + " Waits are spread evenly within each band.")
+            except CountsError as e:
+                st.error(f"{e}. Using the totals instead.")
         st.select_slider("Weeks to simulate from today", options=[26, 52, 78, 104], key=k("horizon"),
                          disabled=settled)
     with right, st.expander("Booking", expanded=True):
@@ -229,7 +319,18 @@ def controls(p: str, two_columns: bool = False) -> None:
 def copy_a_to_b() -> None:
     for f in FIELDS:
         st.session_state[f"B_{f}"] = st.session_state[f"A_{f}"]
+    edited = st.session_state.get("A_surgeon_edited", st.session_state.get("A_surgeon_base"))
+    if edited is not None:
+        st.session_state["B_surgeon_base"] = edited.copy()
+        st.session_state["B_surgeon_edited"] = edited.copy()
+        st.session_state.pop("B_surgeon_editor", None)
     st.session_state["match_msg"] = ""
+
+
+def load_counts_file(p: str) -> None:
+    f = st.session_state.get(f"{p}_counts_file")
+    if f is not None:
+        st.session_state[f"{p}_start_text"] = f.getvalue().decode("utf-8-sig", errors="replace")
 
 
 def match_b_to_a() -> None:

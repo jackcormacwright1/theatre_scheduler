@@ -91,6 +91,10 @@ class RollingConfig:
     start_waiting: int | None = None  # patients on the list now, whole specialty
     start_over_target_share: float = 0.3  # share of them who have already waited longer than target_days
     start_longest_days: float = 182.0  # the longest wait on the list now
+    # More detail (optional; see starting_list.py). Either, per surgeon, (patients, share over target, longest days)...
+    start_by_surgeon: tuple[tuple[int, float, float], ...] | None = None
+    # ...or counts by days waited: (surgeon index or -1 for "share between all", lo days, hi days, patients)
+    start_bands: tuple[tuple[int, float, float, int], ...] | None = None
     target_share: float = 0.95  # the share within target that counts as meeting it (for weeks_to_target)
     plan_samples: int = 500
     policy: str = "in_turn"
@@ -171,6 +175,31 @@ def starting_waits(n: int, target_days: float, over_share: float, longest_days: 
     return np.where(over, np.floor(beyond) + 1, np.floor(within) + 1)  # at least a day: already on the list
 
 
+def starting_list_days(cfg: RollingConfig, n_surgeons: int, rng: np.random.Generator) -> list[np.ndarray]:
+    """Days already waited by each surgeon's patients on today's list, from whichever description
+    the config holds: counts by days waited, per-surgeon totals, or specialty totals."""
+    even = np.full(n_surgeons, 1 / n_surgeons)
+    out: list[list[np.ndarray]] = [[] for _ in range(n_surgeons)]
+    if cfg.start_bands:
+        for k, lo, hi, n in cfg.start_bands:
+            if k >= n_surgeons:
+                raise ValueError(f"starting list refers to surgeon {k + 1} but there are {n_surgeons}")
+            counts = rng.multinomial(int(n), even) if k < 0 else np.eye(n_surgeons, dtype=int)[k] * int(n)
+            for j, c in enumerate(counts):
+                out[j].append(np.floor(rng.uniform(lo, hi, c)) + 1)  # at least a day
+    elif cfg.start_by_surgeon:
+        if len(cfg.start_by_surgeon) != n_surgeons:
+            raise ValueError(f"start_by_surgeon has {len(cfg.start_by_surgeon)} rows for {n_surgeons} surgeons")
+        for j, (n, share, longest) in enumerate(cfg.start_by_surgeon):
+            out[j].append(starting_waits(int(n), cfg.target_days, share, longest, rng))
+    else:
+        total = int(cfg.start_waiting)
+        for j in range(n_surgeons):  # shared evenly: any remainder goes to the first surgeons
+            c = total // n_surgeons + (1 if j < total % n_surgeons else 0)
+            out[j].append(starting_waits(c, cfg.target_days, cfg.start_over_target_share, cfg.start_longest_days, rng))
+    return [np.concatenate(parts) if parts else np.zeros(0) for parts in out]
+
+
 def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
     """Everyone who will ever be on the list in this run: the starting list plus all arrivals.
 
@@ -178,8 +207,7 @@ def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
     so every scenario sees exactly the same patients (common random numbers).
 
     The starting list is either a few weeks of arrivals with waits spread over the first 6 weeks
-    (settled start) or, if ``start_waiting`` is set, that many patients shared evenly between the
-    surgeons, with waits from ``starting_waits``.
+    (settled start) or, if ``start_waiting`` is set, today's list from ``starting_list_days``.
     """
     r_arr, r_true, r_plan = (np.random.default_rng(s) for s in np.random.SeedSequence([seed, 99]).spawn(3))
     surgeons = sorted(world.true_params["surgeon"].unique(), key=lambda x: int(x[1:]))
@@ -189,7 +217,7 @@ def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
     # A separate stream for today's list, so the arrivals are the same whatever list you start from.
     r_start = np.random.default_rng(np.random.SeedSequence([seed, 98]))
     if cfg.start_waiting is not None:
-        start_counts = r_start.multinomial(int(cfg.start_waiting), np.full(len(surgeons), 1 / len(surgeons)))
+        start_days = starting_list_days(cfg, len(surgeons), r_start)
 
     rows = []
     for k, s in enumerate(surgeons):
@@ -197,13 +225,9 @@ def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
         w = share.loc[procs].to_numpy()
         w = w / w.sum()
         # (The order of random draws matches earlier versions, so settled runs reproduce published results.)
-        n_init = r_arr.poisson(rates[k] * cfg.initial_backlog_weeks) if cfg.start_waiting is None else start_counts[k]
+        n_init = r_arr.poisson(rates[k] * cfg.initial_backlog_weeks) if cfg.start_waiting is None else 0
         n_new = r_arr.poisson(rates[k] * total_days / 7)
-        if cfg.start_waiting is None:
-            init_days = r_arr.uniform(-42, 0, n_init)
-        else:
-            init_days = -starting_waits(n_init, cfg.target_days, cfg.start_over_target_share,
-                                        cfg.start_longest_days, r_start)
+        init_days = r_arr.uniform(-42, 0, n_init) if cfg.start_waiting is None else -start_days[k]
         days = np.concatenate([init_days, r_arr.uniform(0, total_days, n_new)])
         for d in np.floor(days).astype(int):
             rows.append((k, r_arr.choice(procs, p=w), d, r_arr.random() < cfg.urgent_share))
