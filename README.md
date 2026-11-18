@@ -10,7 +10,7 @@ The project has three parts:
 - **[Part 2](#part-2-a-year-of-booking-in-four-specialties): a year of booking in four specialties.** How many extra lists does each specialty need to treat 95% of patients within 6 weeks of being added to the waiting list? How does the answer change with the way that target is measured? And what happens to the 85% theatre utilisation target?
 - **[Part 3](#part-3-dashboard-and-scenario-comparison): a dashboard and scenario comparison.** A Streamlit app where every setting can be changed (demand, operating weeks, changeovers, booking rules and more), and two scenarios can be compared head to head. For example: how many patients, lists or theatre minutes separate optimised booking from first come, first served?
 
-**Live dashboard:** [jackcormacwright-theatresceduler.streamlit.app](https://jackcormacwright-theatresceduler.streamlit.app/)
+**Live dashboard:** [theatre-scheduler.streamlit.app](https://theatre-scheduler.streamlit.app)
 
 **All data here is synthetic.** See [Provenance](#provenance).
 
