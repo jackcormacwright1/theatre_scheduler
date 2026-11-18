@@ -2,7 +2,7 @@
 
 Booking elective theatre lists means choosing which patients from a waiting list go on each surgeon's sessions. Case times are uncertain and skewed (most cases come in near the usual time, a few take much longer), so lists booked to average times often overrun, which means overtime or patients cancelled on the day.
 
-The project has two parts:
+The project has three parts:
 
 - **[Part 1](#part-1-one-booking-window): one four-week booking window.** How many more patients can be booked, at the same risk of overrunning, if each case's uncertainty is modelled explicitly with Monte Carlo simulation rather than booking to average times? What does that gain depend on? And does a **hierarchical (partial pooling) duration model** help the planner keep its overrun risk where it means to?
 - **[Part 2](#part-2-a-year-of-booking-in-four-specialties): a year of booking in four specialties.** How many extra lists does each specialty need to treat 95% of patients within 6 weeks of being added to the waiting list? How does the answer change with the way that target is measured? And what happens to the 85% theatre utilisation target?
@@ -204,6 +204,7 @@ Policy comparisons are paired: the same patients, surgeons and leave in every sc
   - specialty, number of surgeons, lists per surgeon and list length;
   - operating weeks a year and extra lists per week;
   - demand, as referrals a week for the whole specialty, shared between the surgeons, so adding surgeons adds capacity rather than demand;
+  - **waiting lists**: each surgeon's own, or **pooled within subspecialty**, so any surgeon who does a patient's operation can take them. Each surgeon in the dashboard's hospitals has one subspecialty (in ENT: rhinology, head and neck or otology) and does the specialty's shared cases plus their subspecialty's, so an otologist can take a tonsillectomy but never sinus surgery;
   - where to start: **today's waiting list** or a settled list after a warm-up, as in Part 2. Today's list can be described by totals (its size, the share already past the target and the longest wait), surgeon by surgeon, or as **counts by weeks waited pasted from a waiting-list extract** (or loaded from a CSV), with or without a surgeon column; plus how many weeks to simulate;
   - how full lists are booked (to average times at a chosen fill %, or to a Monte Carlo overrun limit), and the Monte Carlo planner's duration model;
   - booking order and how much history the planner has;
@@ -230,14 +231,15 @@ Part 2 deliberately forgets where the list starts: a 26-week warm-up lets it set
 
 This brings out two things the settled view hides.
 
-- **The backlog clears before the target is met.** Booking in turn clears the longest waiters first, so new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages, and 200 patients waiting today, 35% of them over 6 weeks), everyone on today's list is treated by about week 10, but 95% within 6 weeks isn't held until about week 17 (week 11 to 21 across five runs). One extra list a week instead of half brings that forward by 5.6 weeks (± 2.1). Meeting the target by week 26 needs about 0.35 extra lists a week, and by week 13 about 0.8.
-- **Where the backlog sits matters.** Put half of those 200 patients on one surgeon, most of them past 6 weeks, and after 13 weeks about 31 patients are still over target rather than 13, and the target is met at about week 23 rather than 17. Each surgeon only treats their own list, so a concentrated backlog can't be shared out (pooling lists is a next step for Part 2).
+- **The backlog clears before the target is met.** Booking in turn clears the longest waiters first, so new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages, each surgeon's own list, and 200 patients waiting today, 35% of them over 6 weeks), everyone on today's list is treated by about week 10, but 95% within 6 weeks isn't held until about week 15 (week 12 to 20 across five runs). One extra list a week instead of half brings that forward by 4.0 weeks (± 0.9). Meeting the target by week 26 needs about 0.1 extra lists a week, and by week 13 about 0.8.
+- **Where the backlog sits matters.** Put half of those 200 patients on one surgeon, most of them past 6 weeks, and after 13 weeks about 38 patients are still over target rather than 11 when the same backlog is shared evenly, and the target is met at about week 25 rather than 17. With their own lists, the other surgeons can't help.
+- **Pooling lists within subspecialty removes most of that.** With pooled lists, that concentrated backlog meets the target at about week 12 rather than 25 (13.8 weeks sooner, ± 7.6) and today's list is cleared by week 8 rather than 15. Even with the backlog shared evenly, pooling meets the target 5.2 weeks sooner (± 1.5) and halves the median wait. The catch is that a bigger queue lets each list be packed tighter, so lists booked to averages overrun more (19% rather than 14%). Filling pooled lists to 95% brings overruns back to the own-list rate and keeps nearly all of the gain (12.4 weeks sooner, ± 6.3). Pooling assumes patients accept any surgeon in the subspecialty ([methodology, section 6.9](docs/METHODOLOGY.md)).
 
 In the year-long simulation, the better duration model mainly shows up as fewer overruns and on-the-day cancellations rather than shorter waits. In general surgery at 24 referrals a week and a 10% limit, lists overran 3.1% of the time against 3.9% with the plug-in model (10 runs; 4.8% against 5.8% with 3 past cases per pair). The differences in waiting times were within the noise, because at that demand the waits are set by capacity rather than by how cautiously lists are booked.
 
 ## First come, first served against optimised booking
 
-[`scripts/run_differentials.py`](scripts/run_differentials.py) runs the comparison you'd make in the dashboard for all four specialties. It uses 10 runs each, at 0.5 extra lists a week, and pairs every comparison. **A** is first come, first served: book in turn, assume each case takes its surgeon's average time, and fill lists to 100%.
+[`scripts/run_differentials.py`](scripts/run_differentials.py) runs the comparison you'd make in the dashboard for all four specialties, on Part 2's hospitals (surgeons with random case mixes). It uses 10 runs each, at 0.5 extra lists a week, and pairs every comparison. **A** is first come, first served: book in turn, assume each case takes its surgeon's average time, and fill lists to 100%.
 
 | Specialty | Monte Carlo, 10% limit: lists overrunning (pts) | cancelled per 100 booked | treated within 6 weeks of being added (pts) | extra lists a year to reach 95% | Monte Carlo, matched overrun rate: treated within 6 weeks (pts) | extra lists a year to reach 95% |
 |---|---|---|---|---|---|---|
@@ -273,7 +275,7 @@ To deploy it on Streamlit Community Cloud:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                                   # 42 tests
+pytest                                   # 45 tests
 python scripts/run_experiment.py         # Part 1: about a minute; writes results/
 python scripts/run_experiment.py --history-cases 200 --out results/history200
 python scripts/run_history_sweep.py      # Part 1 with 3, 15, 50 and 200 past cases per pair: about 4 minutes

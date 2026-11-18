@@ -173,3 +173,44 @@ def test_a_backlog_on_one_surgeon_clears_more_slowly_than_the_same_backlog_share
     one = run(Scenario(**kw, start_by_surgeon=((100, 70, 30),) + ((20, 0, 7),) * 5), 3).per_seed
     assert one["over_target_week_13"].mean() > shared["over_target_week_13"].mean()
     assert one["weeks_to_treat_start_list"].mean() > shared["weeks_to_treat_start_list"].mean()
+
+
+# ---------------------------------------------------------------- subspecialties and pooled lists
+from theatre_sched.synthetic import SUBSPECIALTIES, surgeon_subspecialties  # noqa: E402
+
+
+def test_subspecialty_case_mixes():
+    w = make_world(WorldConfig(specialty="ent", n_surgeons=6, subspecialties=True), seed=3)
+    interests = surgeon_subspecialties("ent", 6)
+    assert interests[:3] == ["rhinology", "head and neck", "otology"]
+    does = w.true_params.groupby("surgeon")["procedure"].apply(set)
+    for k, s in enumerate(does.index):
+        assert does[s] == set(SUBSPECIALTIES["ent"]["common"]) | set(SUBSPECIALTIES["ent"][interests[k]])
+
+
+def test_pooled_lists_only_pass_patients_to_surgeons_who_do_the_procedure():
+    w = make_world(WorldConfig(specialty="ent", n_surgeons=6, subspecialties=True), seed=3)
+    cfg = RollingConfig(referrals_per_week=30, pooling="pooled", weeks_warmup=0, weeks_measured=26,
+                        start_waiting=150, start_over_target_share=0.3, start_longest_days=180)
+    pts = make_patients(w, cfg, seed=3)
+    own_k = pts.surgeon
+    assert np.allclose(pts.pool_true[own_k, np.arange(len(own_k))], pts.true_minutes)  # own surgeon: same case
+    p = simulate(w, cfg, 3, pts)["patients"]
+    done = p[p.treated_day >= 0]
+    does = w.true_params.groupby("surgeon")["procedure"].apply(set)
+    names = sorted(does.index, key=lambda s: int(s[1:]))
+    assert all(proc in does[names[k]] for k, proc in zip(done.treated_by, done.procedure))
+    # the otologists (S3, S6) do grommets and tonsils for anyone, but never sinus surgery or a thyroid
+    oto = done[done.treated_by.isin([2, 5])]
+    assert set(oto.procedure) <= {"grommet_insertion", "tonsillectomy"}
+    assert (done.treated_by != done.surgeon).any()  # some patients did move
+
+
+def test_pooling_within_subspecialty_clears_a_backlog_on_one_surgeon_sooner():
+    kw = {"specialty": "general_surgery", "subspecialties": True, "referrals_per_week": 24, "start_waiting": 200,
+          "start_by_surgeon": ((90, 60, 40),) + ((22, 10, 12),) * 5, "horizon_weeks": 52}
+    own = run(Scenario(**kw), 3).per_seed
+    pooled = run(Scenario(**kw, pooling="pooled"), 3).per_seed
+    assert pooled["over_target_week_26"].mean() < own["over_target_week_26"].mean()
+    assert pooled["weeks_to_treat_start_list"].mean() < own["weeks_to_treat_start_list"].mean()
+    assert pooled["treated_per_year"].mean() >= own["treated_per_year"].mean()

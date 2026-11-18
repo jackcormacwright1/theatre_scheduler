@@ -71,6 +71,9 @@ class Scenario:
     start_by_surgeon: tuple[tuple[int, float, float], ...] | None = None  # (patients, % over target, longest weeks)
     start_bands: tuple[tuple[int, float, float, int], ...] | None = None  # (surgeon index or -1, lo weeks, hi weeks, patients)
     horizon_weeks: int = 52  # weeks simulated from today
+    # Surgeons' case mixes by subspecialty (the dashboard's setting) rather than at random (Parts 1 and 2)
+    subspecialties: bool = False
+    pooling: str = "own"  # "own": each surgeon's own waiting list; "pooled": any surgeon who does the procedure
 
     @property
     def from_today(self) -> bool:
@@ -78,7 +81,8 @@ class Scenario:
 
     def world_config(self) -> WorldConfig:
         return WorldConfig(specialty=self.specialty, n_surgeons=self.n_surgeons,
-                           history_median_cases=self.history_cases, session_minutes=self.session_minutes)
+                           history_median_cases=self.history_cases, session_minutes=self.session_minutes,
+                           subspecialties=self.subspecialties)
 
     def rolling_config(self) -> RollingConfig:
         return RollingConfig(
@@ -89,7 +93,7 @@ class Scenario:
             target_days=7 * self.target_weeks, urgent_target_days=min(28, 7 * self.target_weeks),
             urgent_share=self.urgent_share, policy=self.policy, booking_rule=self.booking_rule,
             fill_fraction=self.fill_fraction, duration_model=self.duration_model,
-            target_share=self.target_share,
+            target_share=self.target_share, pooling=self.pooling,
             **({"weeks_warmup": 0, "weeks_measured": self.horizon_weeks, "start_waiting": int(self.start_waiting),
                 "start_over_target_share": self.start_over_target_pct / 100,
                 "start_longest_days": 7 * self.start_longest_weeks,
@@ -378,7 +382,8 @@ def describe(scn: Scenario) -> str:
     else:
         model = {"plugin": "plug-in", "hierarchical": "hierarchical", "oracle": "true"}[scn.duration_model]
         how = f"to a {round(100 * scn.alpha)}% Monte Carlo overrun limit ({model} duration model)"
-    return f"booking {order}, {how}"
+    lists = ", pooling waiting lists within subspecialty" if scn.pooling == "pooled" else ""
+    return f"booking {order}, {how}{lists}"
 
 
 def headline(cmp: pd.DataFrame, lists_cmp: pd.DataFrame | None = None, target_weeks: int = 6,

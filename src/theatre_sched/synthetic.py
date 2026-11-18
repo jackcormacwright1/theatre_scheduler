@@ -73,6 +73,44 @@ SPECIALTIES = {
     ]),
 }
 
+# Subspecialties. When ``WorldConfig.subspecialties`` is on, each surgeon has one subspecialty interest
+# (assigned in turn, S1 the first, S2 the second, ...) and does the specialty's common procedures plus that
+# subspecialty's. Without it, each surgeon does a random 4-6 of the specialty's procedures (the original setup,
+# used for Parts 1 and 2). Illustrative, like everything else here: the six modelled procedures per specialty
+# are a small part of real case mixes, so, for example, the otologists' ear operations aren't modelled at all.
+SUBSPECIALTIES = {
+    "general_surgery": {
+        "common": ["skin_lesion_excision", "umbilical_hernia_repair", "inguinal_hernia_repair"],
+        "upper GI": ["lap_cholecystectomy", "incisional_hernia_repair"],
+        "colorectal": ["haemorrhoidectomy", "incisional_hernia_repair"],
+    },
+    "orthopaedics": {
+        "common": [],
+        "hip and knee arthroplasty": ["total_hip_replacement", "total_knee_replacement"],
+        "knee and sports": ["knee_arthroscopy", "acl_reconstruction", "total_knee_replacement"],
+        "upper limb": ["carpal_tunnel_release", "shoulder_arthroscopy"],
+    },
+    "gynaecology": {
+        "common": ["operative_hysteroscopy", "diagnostic_laparoscopy", "lap_ovarian_cystectomy"],
+        "minimal access": ["lap_endometriosis_excision", "total_lap_hysterectomy"],
+        "urogynaecology": ["vaginal_hysterectomy_and_repair"],
+        "general gynaecology": ["total_lap_hysterectomy"],
+    },
+    "ent": {
+        "common": ["grommet_insertion", "tonsillectomy"],
+        "rhinology": ["septoplasty", "endoscopic_sinus_surgery"],
+        "head and neck": ["microlaryngoscopy", "thyroidectomy"],
+        "otology": [],
+    },
+}
+
+
+def surgeon_subspecialties(specialty: str, n_surgeons: int) -> list[str]:
+    """The subspecialty interest of S1, S2, ...: assigned in turn."""
+    names = [k for k in SUBSPECIALTIES[specialty] if k != "common"]
+    return [names[k % len(names)] for k in range(n_surgeons)]
+
+
 # Clinical priority categories (P2 = within a month, P3 = within three months,
 # P4 = can wait longer). Targets and wait distributions are modelling assumptions.
 PRIORITY_TARGET_DAYS = {"P2": 28, "P3": 90, "P4": 180}
@@ -94,6 +132,7 @@ class WorldConfig:
     history_median_cases: float = 15.0  # typical number of past cases per surgeon-procedure pair
     history_log_sd: float = 1.0  # spread of that number: some pairs have 1-3 cases, some 100+
     min_procedures_per_surgeon: int = 4
+    subspecialties: bool = False  # surgeons' case mixes by subspecialty (see SUBSPECIALTIES) rather than at random
 
 
 @dataclass
@@ -121,9 +160,15 @@ def make_world(config: WorldConfig | None = None, seed: int = 0) -> World:
     #   mu = log(procedure median) + surgeon speed effect + small pair-specific deviation
     surgeon_effect = r_params.normal(0.0, cfg.surgeon_log_sd, cfg.n_surgeons)
     rows = []
+    interests = surgeon_subspecialties(cfg.specialty, cfg.n_surgeons) if cfg.subspecialties else None
     for k, surgeon in enumerate(surgeons):
-        n_proc = r_params.integers(cfg.min_procedures_per_surgeon, len(procs) + 1)
-        chosen = np.sort(r_params.choice(len(procs), size=n_proc, replace=False))
+        if interests is None:
+            n_proc = r_params.integers(cfg.min_procedures_per_surgeon, len(procs) + 1)
+            chosen = np.sort(r_params.choice(len(procs), size=n_proc, replace=False))
+        else:
+            sub = SUBSPECIALTIES[cfg.specialty]
+            mine = set(sub["common"]) | set(sub[interests[k]])
+            chosen = np.flatnonzero(procs["procedure"].isin(mine).to_numpy())
         for p in chosen:
             mu = (
                 np.log(procs.at[p, "median_min"])

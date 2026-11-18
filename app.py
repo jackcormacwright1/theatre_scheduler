@@ -36,7 +36,7 @@ from theatre_sched.scenarios import (  # noqa: E402
     seed_for,
 )
 from theatre_sched.starting_list import CountsError, parse_counts, summarise, to_scenario_bands  # noqa: E402
-from theatre_sched.synthetic import WorldConfig, make_world  # noqa: E402
+from theatre_sched.synthetic import SUBSPECIALTIES, WorldConfig, make_world, surgeon_subspecialties  # noqa: E402
 
 st.set_page_config(page_title="Theatre list booking simulator", page_icon="🩺", layout="wide")
 
@@ -51,6 +51,7 @@ NEUTRAL, MUTED, GRID, BAND = "#52514e", "#898781", "#e1e0d9", "#f0efea"
 GOOD, CRITICAL = "#0ca30c", "#d03b3b"
 START_NAMES = {"today": "Today's waiting list", "settled": "A settled list (steady state)"}
 DESCRIBE_NAMES = {"totals": "Totals", "surgeon": "Surgeon by surgeon", "counts": "Counts by weeks waited"}
+POOLING_NAMES = {"own": "Each surgeon's own", "pooled": "Pooled within subspecialty"}
 EXAMPLE_COUNTS = "weeks,patients\n0-6,130\n6-12,40\n12-18,18\n18-26,9\n26-40,3"
 SPECIALTY_NAMES = {"general_surgery": "General surgery", "orthopaedics": "Orthopaedics",
                    "gynaecology": "Gynaecology", "ent": "ENT"}
@@ -65,7 +66,7 @@ MODEL_NAMES = {"plugin": "Plug-in: each pair's own past cases",
 DEFAULTS = {"specialty": "general_surgery", "n_surgeons": 6, "lists_per_surgeon": 1, "session_minutes": 480,
             "working_weeks": 42, "referrals": 24, "extra_lists": 0.5, "turnaround": 15, "policy": "in_turn",
             "booking_rule": "average", "fill_pct": 100, "alpha_pct": 10, "duration_model": "plugin",
-            "overrun_tolerance": 30, "history_cases": 15,
+            "overrun_tolerance": 30, "history_cases": 15, "pooling": "own",
             "start_mode": "today", "start_describe": "totals", "start_waiting": 200, "start_over_pct": 35,
             "start_longest": 30, "start_text": EXAMPLE_COUNTS, "horizon": 52}
 B_START = {**DEFAULTS, "booking_rule": "monte_carlo"}
@@ -134,7 +135,8 @@ def settled_list(scn: dict) -> tuple[float, float]:
 def demand_share(specialty: str, n_surgeons: int, lists_per_surgeon: int, session_minutes: float,
                  working_weeks: int, referrals: float) -> float:
     """Theatre time the referrals need, as a share of the time available after leave (15-minute changeovers)."""
-    world = make_world(WorldConfig(specialty=specialty, n_surgeons=n_surgeons), seed=seed_for(specialty, 0))
+    world = make_world(WorldConfig(specialty=specialty, n_surgeons=n_surgeons, subspecialties=True),
+                       seed=seed_for(specialty, 0))
     cfg = RollingConfig(lists_per_surgeon=lists_per_surgeon, session_minutes=session_minutes,
                         working_weeks=working_weeks, referrals_per_week=referrals)
     return implied_load(world, cfg)
@@ -143,8 +145,8 @@ def demand_share(specialty: str, n_surgeons: int, lists_per_surgeon: int, sessio
 @st.cache_data(show_spinner=False, max_entries=32)
 def duration_estimates(specialty: str, n_surgeons: int, history: float) -> tuple[pd.DataFrame, float, float, float]:
     """For one synthetic hospital: each surgeon-procedure pair's own average, hierarchical estimate and truth."""
-    world = make_world(WorldConfig(specialty=specialty, n_surgeons=n_surgeons, history_median_cases=history),
-                       seed=seed_for(specialty, 0))
+    world = make_world(WorldConfig(specialty=specialty, n_surgeons=n_surgeons, history_median_cases=history,
+                                   subspecialties=True), seed=seed_for(specialty, 0))
     model = fit_hierarchical(world.history)
     t = model.table.merge(world.true_params, on=["surgeon", "procedure"])
     t["own_minutes"] = np.exp(t["ybar"])
@@ -168,9 +170,32 @@ def scenario_from_state(p: str) -> Scenario:
         fill_fraction=g("fill_pct") / 100, alpha=g("alpha_pct") / 100, duration_model=g("duration_model"),
         overrun_tolerance=float(g("overrun_tolerance")), target_weeks=int(st.session_state["target_weeks"]),
         target_share=st.session_state["threshold_pct"] / 100,
-        horizon_weeks=int(g("horizon")),
+        horizon_weeks=int(g("horizon")), subspecialties=True, pooling=g("pooling"),
         **start_fields(p),
     )
+
+
+def proc_name(p: str) -> str:
+    return p.replace("_", " ").replace("acl ", "ACL ")
+
+
+def join_and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def subspecialty_caption(specialty: str, n_surgeons: int) -> str:
+    """Who does what: 'S1, S4: rhinology (septoplasty, ...); ... Everyone does grommet insertion and tonsillectomy.'"""
+    sub = SUBSPECIALTIES[specialty]
+    groups: dict[str, list[str]] = {}
+    for k, name in enumerate(surgeon_subspecialties(specialty, n_surgeons)):
+        groups.setdefault(name, []).append(f"S{k + 1}")
+    parts = [f"{', '.join(who)} {name}" + (f" ({', '.join(proc_name(q) for q in sub[name])})" if sub[name]
+                                           else " (only the shared cases: their own operations aren't modelled)")
+             for name, who in groups.items()]
+    text = "Each surgeon has one subspecialty: " + "; ".join(parts) + "."
+    if sub["common"]:
+        text += f" Everyone does {join_and([proc_name(q) for q in sub['common']])}."
+    return text
 
 
 def surgeon_rows(p: str) -> pd.DataFrame:
@@ -219,7 +244,9 @@ def controls(p: str, two_columns: bool = False) -> None:
     left, right = st.columns(2) if two_columns else (st.container(), st.container())
     with left, st.expander("Specialty and theatre time", expanded=True):
         st.selectbox("Specialty", list(SPECIALTY_NAMES), format_func=SPECIALTY_NAMES.get, key=k("specialty"))
-        st.slider("Surgeons", 2, 12, key=k("n_surgeons"), help="Each surgeon has their own waiting list.")
+        st.slider("Surgeons", 2, 12, key=k("n_surgeons"),
+                  help="Subspecialty interests are given out in turn: S1 the first, S2 the second, and so on.")
+        st.caption(subspecialty_caption(st.session_state[k("specialty")], st.session_state[k("n_surgeons")]))
         st.slider("Lists per surgeon per week", 1, 3, key=k("lists_per_surgeon"))
         st.select_slider("List length (minutes)", options=[240, 360, 480, 600], key=k("session_minutes"))
         st.slider("Operating weeks a year", 32, 52, step=2, key=k("working_weeks"),
@@ -229,8 +256,9 @@ def controls(p: str, two_columns: bool = False) -> None:
                        "0.25 = one every four weeks.")
     with left, st.expander("Demand", expanded=True):
         st.slider("Referrals added to the waiting list per week", 4, 100, key=k("referrals"),
-                  help="Decisions to operate for the whole specialty, shared equally between the surgeons. "
-                       "Adding surgeons or lists adds capacity, not demand.")
+                  help="Decisions to operate for the whole specialty, shared between the surgeons so that each "
+                       "one's referrals need about the same theatre time. Adding surgeons or lists adds capacity, "
+                       "not demand.")
         share = demand_share(st.session_state[k("specialty")], st.session_state[k("n_surgeons")],
                              st.session_state[k("lists_per_surgeon")], st.session_state[k("session_minutes")],
                              st.session_state[k("working_weeks")], st.session_state[k("referrals")])
@@ -268,8 +296,10 @@ def controls(p: str, two_columns: bool = False) -> None:
                                                                  width=80, help="Longest wait now, in weeks"),
                 })
             st.session_state[f"{p}_surgeon_edited"] = edited
-            st.caption(f"{int(edited['Waiting'].sum()):,} patients in all. Edit any cell; each surgeon only treats "
-                       "their own list.")
+            pooled_now = st.session_state[k("pooling")] == "pooled"
+            st.caption(f"{int(edited['Waiting'].sum()):,} patients in all. Edit any cell. "
+                       + ("With pooled lists, other surgeons in the subspecialty can take these patients."
+                          if pooled_now else "Each surgeon only treats their own list."))
             st.button("Reset to the totals, split evenly", key=f"{p}_reset_surgeons", on_click=reset_surgeon_rows,
                       args=(p,), help="Uses the totals from the 'Totals' option.")
             del base
@@ -297,6 +327,12 @@ def controls(p: str, two_columns: bool = False) -> None:
         st.select_slider("Weeks to simulate from today", options=[26, 52, 78, 104], key=k("horizon"),
                          disabled=settled)
     with right, st.expander("Booking", expanded=True):
+        st.radio("Waiting lists", list(POOLING_NAMES), format_func=POOLING_NAMES.get, key=k("pooling"),
+                 horizontal=True,
+                 help="Pooled: a patient can go on the list of any surgeon who does their procedure, so the shared "
+                      "cases are pooled across the specialty and the subspecialty cases within the subspecialty. "
+                      "Each week, patients are taken in booking order and go on the earliest list with room. A case "
+                      "takes as long as that surgeon usually takes, adjusted for how complex the patient is.")
         st.radio("How full lists are booked", list(RULE_NAMES), format_func=RULE_NAMES.get, key=k("booking_rule"))
         avg = st.session_state[k("booking_rule")] == "average"
         st.slider("Fill lists to (% of session)", 60, 120, step=5, key=k("fill_pct"), disabled=not avg)
@@ -568,9 +604,11 @@ def weight_chart(t: pd.DataFrame, k: float):
     pts = alt.Chart(t).mark_circle(size=55, color=BLUE, opacity=0.85).encode(
         x="n:Q", y="weight:Q",
         tooltip=["surgeon:N", "procedure:N", "n:Q", alt.Tooltip("weight:Q", format=".2f")])
-    half = pd.DataFrame({"n": [k], "w": [0.5], "label": [f"k ≈ {k:.0f} cases: half own data, half prior"]})
+    half = pd.DataFrame({"n": [k], "w": [0.5], "label": [f"k ≈ {k:.0f}: half own data, half prior"]})
     mark = alt.Chart(half).mark_point(shape="circle", size=70, filled=False, color=NEUTRAL, strokeWidth=1.5).encode(x="n:Q", y="w:Q")
-    lab = alt.Chart(half).mark_text(align="left", dx=10, dy=26, color=NEUTRAL, fontSize=11).encode(x="n:Q", y="w:Q", text="label:N")
+    # Label below right of the point when it sits towards the left, else above left (empty: the curve rises)
+    place = {"align": "left", "dx": 10, "dy": 26} if k < 12 else {"align": "right", "dx": -8, "dy": -56}
+    lab = alt.Chart(half).mark_text(**place, color=NEUTRAL, fontSize=11).encode(x="n:Q", y="w:Q", text="label:N")
     return (line + pts + mark + lab).properties(height=300)
 
 

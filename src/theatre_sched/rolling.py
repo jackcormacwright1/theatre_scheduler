@@ -36,6 +36,15 @@ Booking rules (how full a list may be):
                   filled up to ``fill_fraction`` of the session. With ``in_turn`` this is plain
                   first-come-first-served booking.
 
+Waiting lists:
+
+* ``own``     each patient waits for the surgeon they were referred to (the default).
+* ``pooled``  any surgeon who does the patient's procedure can take them. With the world's surgeons set up
+              by subspecialty (``WorldConfig.subspecialties``), that pools lists within each subspecialty, plus
+              the common procedures across the specialty. Each week, patients are taken in the booking order
+              and go on the earliest list, of any surgeon who can do their procedure, where they fit. Case
+              times depend on who operates: the patient's own complexity is shared, the surgeon's speed isn't.
+
 Booking policies (who gets first claim on the space):
 
 * ``in_turn``     urgent (P2) patients first, then everyone else in order of how long they've waited.
@@ -101,6 +110,7 @@ class RollingConfig:
     booking_rule: str = "monte_carlo"  # or "average"
     fill_fraction: float = 1.0  # for the "average" rule: fill lists to this share of the session
     duration_model: str = "plugin"  # the Monte Carlo planner's model: "plugin", "hierarchical" or "oracle"
+    pooling: str = "own"  # "own" (each surgeon's own list) or "pooled" (any surgeon who does the procedure)
 
 
 @dataclass
@@ -114,6 +124,13 @@ class Patients:
     expected: np.ndarray  # the planner's expected case time (from its lognormal model)
     hist_mean: np.ndarray  # the surgeon's historical average time for the procedure
     plan: np.ndarray  # the planner's Monte Carlo draws, one row per patient
+    # For pooled lists only: the same quantities if surgeon k operates, indexed [k, patient] (NaN where k
+    # doesn't do the patient's procedure), and who can operate on whom.
+    eligible: np.ndarray | None = None
+    pool_true: np.ndarray | None = None
+    pool_expected: np.ndarray | None = None
+    pool_hist: np.ndarray | None = None
+    pool_plan: np.ndarray | None = None  # [k, patient, draw], float32
 
 
 def _minutes_per_case(world: World, reference_turnaround: float) -> np.ndarray:
@@ -136,7 +153,9 @@ def arrival_rates(world: World, cfg: RollingConfig, reference_turnaround: float 
     Two ways of setting demand:
 
     * ``referrals_per_week`` (used by the dashboard): a fixed number of patients a week for the
-      whole specialty, shared equally between the surgeons. Adding surgeons adds capacity, not demand.
+      whole specialty, shared equally between the surgeons (or, when surgeons have subspecialty case
+      mixes, shared so that each surgeon's demand needs the same theatre time). Adding surgeons adds
+      capacity, not demand.
     * ``load`` (used by the Part 2 scripts): each surgeon's demand is ``load`` x the session time
       they have available after leave, so demand scales with the number of surgeons.
 
@@ -145,6 +164,11 @@ def arrival_rates(world: World, cfg: RollingConfig, reference_turnaround: float 
     """
     n = world.config.n_surgeons
     if cfg.referrals_per_week is not None:
+        if getattr(world.config, "subspecialties", False):
+            # Surgeons' case mixes differ a lot by subspecialty, so share the referrals so that each surgeon's
+            # demand needs the same theatre time: fewer patients for surgeons whose cases are long.
+            inv = 1 / _minutes_per_case(world, reference_turnaround)
+            return cfg.referrals_per_week * inv / inv.sum()
         return np.full(n, cfg.referrals_per_week / n)
     available = cfg.lists_per_surgeon * cfg.session_minutes * cfg.working_weeks / 52
     return cfg.load * available / _minutes_per_case(world, reference_turnaround)
@@ -175,10 +199,24 @@ def starting_waits(n: int, target_days: float, over_share: float, longest_days: 
     return np.where(over, np.floor(beyond) + 1, np.floor(within) + 1)  # at least a day: already on the list
 
 
-def starting_list_days(cfg: RollingConfig, n_surgeons: int, rng: np.random.Generator) -> list[np.ndarray]:
+def _split(total: int, shares: np.ndarray) -> np.ndarray:
+    """Whole numbers in proportion to ``shares`` that add up to ``total`` (largest remainders; ties to the
+    first surgeons, so equal shares give total // n each, with the remainder to the first surgeons)."""
+    raw = total * shares / shares.sum()
+    out = np.floor(raw + 1e-9).astype(int)
+    left = total - out.sum()
+    order = np.lexsort((np.arange(len(raw)), -(raw - out)))
+    out[order[:left]] += 1
+    return out
+
+
+def starting_list_days(cfg: RollingConfig, n_surgeons: int, rng: np.random.Generator,
+                       shares: np.ndarray | None = None) -> list[np.ndarray]:
     """Days already waited by each surgeon's patients on today's list, from whichever description
-    the config holds: counts by days waited, per-surgeon totals, or specialty totals."""
-    even = np.full(n_surgeons, 1 / n_surgeons)
+    the config holds: counts by days waited, per-surgeon totals, or specialty totals. Lists without
+    a surgeon breakdown are shared between surgeons in proportion to ``shares`` (default equal)."""
+    shares = np.full(n_surgeons, 1 / n_surgeons) if shares is None else np.asarray(shares, float) / np.sum(shares)
+    even = shares
     out: list[list[np.ndarray]] = [[] for _ in range(n_surgeons)]
     if cfg.start_bands:
         for k, lo, hi, n in cfg.start_bands:
@@ -193,9 +231,7 @@ def starting_list_days(cfg: RollingConfig, n_surgeons: int, rng: np.random.Gener
         for j, (n, share, longest) in enumerate(cfg.start_by_surgeon):
             out[j].append(starting_waits(int(n), cfg.target_days, share, longest, rng))
     else:
-        total = int(cfg.start_waiting)
-        for j in range(n_surgeons):  # shared evenly: any remainder goes to the first surgeons
-            c = total // n_surgeons + (1 if j < total % n_surgeons else 0)
+        for j, c in enumerate(_split(int(cfg.start_waiting), shares)):
             out[j].append(starting_waits(c, cfg.target_days, cfg.start_over_target_share, cfg.start_longest_days, rng))
     return [np.concatenate(parts) if parts else np.zeros(0) for parts in out]
 
@@ -217,7 +253,7 @@ def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
     # A separate stream for today's list, so the arrivals are the same whatever list you start from.
     r_start = np.random.default_rng(np.random.SeedSequence([seed, 98]))
     if cfg.start_waiting is not None:
-        start_days = starting_list_days(cfg, len(surgeons), r_start)
+        start_days = starting_list_days(cfg, len(surgeons), r_start, shares=rates)
 
     rows = []
     for k, s in enumerate(surgeons):
@@ -246,6 +282,13 @@ def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
     else:
         raise ValueError(f"unknown duration_model: {cfg.duration_model}")
     plan = planner.sample(df, cfg.plan_samples, r_plan)
+    pooled = _pooled_arrays(world, df, surgeons, truth, planner, fit, true_minutes, cfg, seed) \
+        if cfg.pooling == "pooled" else {}
+    if pooled:  # with their own surgeon, a patient's case is exactly as on an own-surgeon list
+        own_k, ids = df["surgeon_idx"].to_numpy(), np.arange(len(df))
+        pooled["pool_true"][own_k, ids] = true_minutes
+        pooled["pool_plan"][own_k, ids] = plan
+        pooled["pool_expected"][own_k, ids] = plan.mean(axis=1)
     return Patients(
         surgeon=df["surgeon_idx"].to_numpy(),
         procedure=df["procedure"].to_numpy(),
@@ -256,7 +299,40 @@ def make_patients(world: World, cfg: RollingConfig, seed: int) -> Patients:
         expected=plan.mean(axis=1),
         hist_mean=fit.historical_mean(df),
         plan=plan,
+        **pooled,
     )
+
+
+def _pooled_arrays(world: World, df: pd.DataFrame, surgeons: list[str], truth: LognormalPairModel, planner,
+                   fit, true_minutes: np.ndarray, cfg: RollingConfig, seed: int) -> dict:
+    """What each patient's case would take, and what the planner would expect, with each surgeon who does
+    their procedure. The patient's own complexity (their standardised deviation from their own surgeon's
+    typical time) is kept, so a long case stays relatively long whoever operates."""
+    r_pool = np.random.default_rng(np.random.SeedSequence([seed, 97]))
+    tp = world.true_params.set_index(["surgeon", "procedure"])
+    own = tp.loc[list(zip(df["surgeon"], df["procedure"]))]
+    z = (np.log(true_minutes) - own["mu"].to_numpy()) / own["sigma"].to_numpy()
+    n, K = len(df), len(surgeons)
+    eligible = np.zeros((K, n), dtype=bool)
+    pool_true = np.full((K, n), np.nan)
+    pool_expected = np.full((K, n), np.nan)
+    pool_hist = np.full((K, n), np.nan)
+    pool_plan = np.full((K, n, cfg.plan_samples), np.nan, dtype=np.float32)
+    for k, s in enumerate(surgeons):
+        does = set(world.true_params.loc[world.true_params.surgeon == s, "procedure"])
+        m = df["procedure"].isin(does).to_numpy()
+        eligible[k] = m
+        if not m.any():
+            continue
+        dk = df.loc[m, ["procedure"]].assign(surgeon=s)
+        par = tp.loc[list(zip(dk["surgeon"], dk["procedure"]))]
+        pool_true[k, m] = np.exp(par["mu"].to_numpy() + par["sigma"].to_numpy() * z[m])
+        draws = planner.sample(dk, cfg.plan_samples, r_pool)
+        pool_plan[k, m] = draws
+        pool_expected[k, m] = draws.mean(axis=1)
+        pool_hist[k, m] = fit.historical_mean(dk)
+    return {"eligible": eligible, "pool_true": pool_true, "pool_expected": pool_expected,
+            "pool_hist": pool_hist, "pool_plan": pool_plan}
 
 
 def make_leave(n_surgeons: int, n_weeks: int, cfg: RollingConfig, seed: int) -> np.ndarray:
@@ -296,11 +372,17 @@ def simulate(world: World, cfg: RollingConfig, seed: int, pts: Patients | None =
     if cfg.booking_rule not in BOOKING_RULES:
         raise ValueError(f"unknown booking_rule: {cfg.booking_rule}")
     pts = pts if pts is not None else make_patients(world, cfg, seed)
+    pooled = cfg.pooling == "pooled"
+    if pooled and pts.eligible is None:
+        raise ValueError("pooled lists need patients made with pooling='pooled'")
     # What the booking team expects each case to take: the planner's model, or the plain historical average.
     expected = pts.hist_mean if cfg.booking_rule == "average" else pts.expected
+    if pooled:  # the same, for each surgeon who could operate: [surgeon, patient]
+        exp_k = pts.pool_hist if cfg.booking_rule == "average" else pts.pool_expected
     n_surg = int(pts.surgeon.max()) + 1
     n = len(pts.added_day)
     treated_day = np.full(n, -1)
+    treated_by = np.full(n, -1)
     cancellations = np.zeros(n, dtype=int)
     L, T = cfg.session_minutes, cfg.turnaround
     n_weeks = cfg.weeks_warmup + cfg.weeks_measured
@@ -318,8 +400,9 @@ def simulate(world: World, cfg: RollingConfig, seed: int, pts: Patients | None =
         n_baseline = len(sessions)
         n_extra = int(np.floor(cfg.extra_lists * (week + 1) + 1e-9) - np.floor(cfg.extra_lists * week + 1e-9))
         if n_extra:
+            due = waiting & (waited + 13 >= pts.target)
             due_minutes = np.array([
-                expected[waiting & (pts.surgeon == k) & (waited + 13 >= pts.target)].sum()
+                np.nansum(exp_k[k, due & pts.eligible[k]]) if pooled else expected[due & (pts.surgeon == k)].sum()
                 for k in range(n_surg)
             ])
             due_minutes[leave[:, week]] = -np.inf  # extra lists only go to surgeons who are working
@@ -333,44 +416,71 @@ def simulate(world: World, cfg: RollingConfig, seed: int, pts: Patients | None =
         totals = [np.zeros(cfg.plan_samples) for _ in sessions]
         planned = np.zeros(len(sessions))  # for the "average" rule
         left_unbooked = np.zeros(len(sessions), dtype=int)  # surgeon's eligible patients who didn't fit
-        for k in range(n_surg):
-            mine = [j for j, (sk, _) in enumerate(sessions) if sk == k]
-            if not mine:
-                continue
-            mine.sort(key=lambda j: sessions[j][1])
-            idx = np.flatnonzero(waiting & (pts.surgeon == k))
+
+        def try_book(i: int, j: int, k: int, booked=booked, totals=totals, planned=planned) -> bool:
+            """Put patient i on list j (surgeon k) if they fit under the booking rule."""
+            gap = T if booked[j] else 0.0
+            if cfg.booking_rule == "average":
+                e = exp_k[k, i] if pooled else expected[i]
+                if planned[j] + gap + e <= cfg.fill_fraction * L:
+                    booked[j].append(i)
+                    planned[j] += gap + e
+                    return True
+                return False
+            new = totals[j] + (pts.pool_plan[k, i] if pooled else pts.plan[i]) + gap
+            if np.mean(new > L) <= cfg.alpha:
+                booked[j].append(i)
+                totals[j] = new
+                return True
+            return False
+
+        if pooled:
+            # One queue: each patient, in booking order, goes on the earliest list of any surgeon who does
+            # their procedure where they fit.
+            idx = np.flatnonzero(waiting)
+            by_time = sorted(range(len(sessions)), key=lambda j: (sessions[j][1], sessions[j][0]))
+            placed = np.zeros(n, dtype=bool)
             for pos in _order(idx, pts, waited, cfg.policy, expected):
                 i = idx[pos]
+                for j in by_time:
+                    k = sessions[j][0]
+                    if pts.eligible[k, i] and try_book(i, j, k):
+                        placed[i] = True
+                        break
+            for j, (k, _) in enumerate(sessions):
+                left_unbooked[j] = int(np.sum(waiting & pts.eligible[k] & ~placed))
+        else:
+            for k in range(n_surg):
+                mine = [j for j, (sk, _) in enumerate(sessions) if sk == k]
+                if not mine:
+                    continue
+                mine.sort(key=lambda j: sessions[j][1])
+                idx = np.flatnonzero(waiting & (pts.surgeon == k))
+                for pos in _order(idx, pts, waited, cfg.policy, expected):
+                    i = idx[pos]
+                    for j in mine:
+                        if try_book(i, j, k):
+                            break
+                left = len(idx) - sum(len(booked[j]) for j in mine)
                 for j in mine:
-                    gap = T if booked[j] else 0.0
-                    if cfg.booking_rule == "average":
-                        if planned[j] + gap + expected[i] <= cfg.fill_fraction * L:
-                            booked[j].append(i)
-                            planned[j] += gap + expected[i]
-                            break
-                    else:
-                        new = totals[j] + pts.plan[i] + gap
-                        if np.mean(new > L) <= cfg.alpha:
-                            booked[j].append(i)
-                            totals[j] = new
-                            break
-            left = len(idx) - sum(len(booked[j]) for j in mine)
-            for j in mine:
-                left_unbooked[j] = left
+                    left_unbooked[j] = left
 
         # 2. On the day, with true case times.
         for j, (k, day) in enumerate(sessions):
-            order = sorted(booked[j], key=lambda i: -expected[i])
+            e_list = exp_k[k] if pooled else expected
+            true_list = pts.pool_true[k] if pooled else pts.true_minutes
+            order = sorted(booked[j], key=lambda i: -e_list[i])
             t, touch, done, cancelled, end = 0.0, 0.0, 0, 0, 0.0
             for i in order:
                 start = t + (T if done else 0.0)
-                if start >= L or start + expected[i] > L + cfg.overrun_tolerance:
+                if start >= L or start + e_list[i] > L + cfg.overrun_tolerance:
                     cancellations[i] += 1
                     cancelled += 1
                     continue
-                end = start + pts.true_minutes[i]
+                end = start + true_list[i]
                 touch += max(0.0, min(end, L) - start)
                 treated_day[i] = day
+                treated_by[i] = k
                 t = end
                 done += 1
             lists_log.append({"week": week, "surgeon": k, "day": day, "extra": j >= n_baseline,
@@ -397,7 +507,7 @@ def simulate(world: World, cfg: RollingConfig, seed: int, pts: Patients | None =
 
     patients = pd.DataFrame({"surgeon": pts.surgeon, "procedure": pts.procedure, "added_day": pts.added_day,
                              "urgent": pts.urgent, "expected": pts.expected, "treated_day": treated_day,
-                             "cancellations": cancellations})
+                             "treated_by": treated_by, "cancellations": cancellations})
     return {"weekly": pd.DataFrame(weekly), "lists": pd.DataFrame(lists_log), "patients": patients}
 
 

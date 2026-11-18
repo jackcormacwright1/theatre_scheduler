@@ -234,7 +234,7 @@ Code: [`rolling.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob
 
 ### 6.1 Time, surgeons and leave
 
-Time runs in days. A **settled** simulation (used for all of Part 2) is 26 weeks of **warm-up**, discarded, followed by 52 **measured** weeks. A simulation **from today's waiting list** (section 6.8) has no warm-up and measures every week from the start. Each of the $N$ surgeons (6 by default) has $\ell$ all-day lists a week (1 by default) on a fixed weekday and their own waiting list.
+Time runs in days. A **settled** simulation (used for all of Part 2) is 26 weeks of **warm-up**, discarded, followed by 52 **measured** weeks. A simulation **from today's waiting list** (section 6.8) has no warm-up and measures every week from the start. Each of the $N$ surgeons (6 by default) has $\ell$ all-day lists a week (1 by default) on a fixed weekday and their own waiting list, unless lists are pooled (section 6.9).
 
 **Leave.** Each surgeon operates $W$ weeks a year (42 by default). The remaining $52 - W$ weeks are taken as $(52 - W)/2$ non-overlapping two-week blocks at random points in each year, and no lists run while a surgeon is on leave.
 
@@ -242,7 +242,7 @@ Time runs in days. A **settled** simulation (used for all of Part 2) is 26 weeks
 
 Patients are added to the list by a **Poisson process**: in each week the number of new patients is random, with a fixed average rate and no memory of previous weeks. There are two ways of setting the rate.
 
-- **Referrals** (the dashboard). $R$ patients a week for the whole specialty, shared equally between the surgeons, so each receives $R/N$ a week. Adding surgeons or lists adds capacity, not demand.
+- **Referrals** (the dashboard). $R$ patients a week for the whole specialty. With Part 2's random case mixes, they're shared equally, so each surgeon receives $R/N$ a week. With subspecialty case mixes (section 6.9, used by the dashboard), they're shared so that each surgeon's referrals need the same theatre time: a surgeon whose cases average $m_k$ minutes, including a 15-minute changeover, receives $\lambda_k = R\,(1/m_k)\big/\sum_j (1/m_j)$ a week. Either way, adding surgeons or lists adds capacity, not demand.
 - **Load** (the Part 2 and Part 3 scripts). Each surgeon receives enough patients to fill a share $\rho$ (0.85 by default) of the session time they have available after leave, so demand scales with the number of surgeons. These scripts never vary the number of surgeons.
 
 The two are linked by the share of available theatre time the demand needs:
@@ -252,6 +252,8 @@ $$\rho = \frac{R \times \bar m}{N \times \ell \times L \times W/52}$$
 where $\bar m$ is the average theatre minutes per case, including a 15-minute changeover, across the surgeons' case mixes.
 
 > **Worked example.** General surgery, 6 surgeons, one 480-minute list a week each, 42 operating weeks. Available time is $6 \times 480 \times 42/52 = 2{,}326$ minutes a week. At $R = 24$ referrals a week and about 82.6 minutes per case, demand needs $24 \times 82.6 = 1{,}982$ minutes, so $\rho = 1{,}982/2{,}326 = 85\%$. The dashboard shows this figure under the referrals setting.
+>
+> **With subspecialties.** In the dashboard's first general-surgery hospital, S1 (upper GI) averages 98.6 minutes a case and S2 (colorectal) 66.4. Across the six surgeons $\sum_j 1/m_j = 0.0750$, so S1 receives $24 \times (1/98.6)/0.0750 = 3.2$ patients a week and S2 $24 \times (1/66.4)/0.0750 = 4.8$. Both need $3.2 \times 98.6 = 4.8 \times 66.4 = 320$ minutes a week, so demand needs $6 \times 320 = 1{,}920$ of the 2,326 minutes: $\rho = 82\%$.
 
 Demand is fixed in **patients**, calculated at a reference 15-minute changeover, so a scenario with faster changeovers sees the same patients rather than more of them. Each new patient gets a procedure (by the referral shares for their surgeon's procedures) and an urgent (P2) flag with probability 10%. Each patient also gets one true duration, kept if they're cancelled and rebooked, and 500 planner draws. Every patient who will ever be on the list is generated up front from the seed. That way, every booking policy and every number of extra lists sees exactly the same patients.
 
@@ -280,7 +282,7 @@ Each patient in that order goes on the earliest of their surgeon's lists this we
 - **To average case times** (`average`): $\sum \bar m_i + c\,(n_j - 1) \le f L$, using the historical averages from section 3. The default is $f = 1.0$.
 - **To a Monte Carlo overrun limit** (`monte_carlo`): $\hat P_j \le \alpha$, using the planner's 500 draws per patient. The default is $\alpha = 0.10$.
 
-The same expected durations (historical averages for the average rule, plug-in means for the Monte Carlo rule) are used for ordering and on the day.
+The same expected durations (historical averages for the average rule, plug-in means for the Monte Carlo rule) are used for ordering and on the day. With pooled lists (section 6.9), there is one queue for the whole specialty rather than one per surgeon.
 
 **Extra lists.** $E$ extra all-day lists a week can be fractional. The number in week $t$ is $\lfloor E(t+1) \rfloor - \lfloor E t \rfloor$, where $\lfloor x \rfloor$ means rounding down, so $E = 0.25$ gives one list every fourth week. They run on Saturdays and go one at a time to the working surgeon with the most expected minutes of due patients. After each allocation, that surgeon's due minutes are reduced by 80% of a list.
 
@@ -335,7 +337,7 @@ A settled simulation answers "where do these settings lead?", but deliberately f
 
 > **Worked example.** $T = 42$ days and $D = 210$ days (30 weeks). A patient over target with $u = 0.5$ has waited $42 + 168 \times (1 - \sqrt{0.5}) = 42 + 168 \times 0.293 = 91$ days, 13 weeks. Half of the over-target patients have waited less than that, because the density is highest just past the target. The mean over-target wait is a third of the way from $T$ to $D$: $42 + 168/3 = 98$ days.
 
-*Surgeon by surgeon.* The same three numbers for each surgeon, $S_k$, $q_k$ and $D_k$, drawn the same way. Because each surgeon only treats their own list, this is what shows the effect of a backlog concentrated on one or two consultants.
+*Surgeon by surgeon.* The same three numbers for each surgeon, $S_k$, $q_k$ and $D_k$, drawn the same way. Unless lists are pooled, each surgeon only treats their own list, so this is what shows the effect of a backlog concentrated on one or two consultants.
 
 *Counts by weeks waited*, as in a waiting-list extract: lines of `weeks, patients`, or `surgeon, weeks, patients`, pasted or loaded from a CSV ([`starting_list.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/src/theatre_sched/starting_list.py)). Weeks can be a band (`12-18`, meaning at least 12 and under 18), a whole number of weeks (`7`, meaning 7 to 8) or open-ended (`52+`, taken as 52 to 78 weeks). Within a band, waits are spread evenly. Surgeon names are matched, in the order they first appear, to the simulated surgeons S1, S2 and so on; any simulated surgeons left over start with an empty list. Without a surgeon column, each band is shared between the surgeons at random with equal chances. The share past the target, shown when the counts are read, counts a band that straddles the target in proportion: with $T$ = 6 weeks, half of a 4–8 week band counts as past it.
 
@@ -359,8 +361,51 @@ If the run never meets the target at $E_{k-1}$, $E^{\ast} = E_k$. The reported f
 
 **Findings this view brings out.**
 
-- Booking in turn clears the longest waiters first, so everyone on today's list is treated well before the target is met: new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages; 200 patients waiting, 35% over 6 weeks, the longest at 30), today's list is all treated by about week 10, but 95% within 6 weeks isn't held until about week 17, ranging from week 11 to 21 across five runs.
-- Where the backlog sits matters. Putting 100 of the 200 patients on one surgeon (70% of them past 6 weeks) and 20 recent referrals on each of the others leaves about 31 patients over target after 13 weeks, against 13 when the same backlog is shared evenly. The target is met at about week 23 rather than 17, and today's list takes until about week 14 to clear rather than week 10 (five runs each).
+- Booking in turn clears the longest waiters first, so everyone on today's list is treated well before the target is met: new referrals queue behind the backlog and pass the target while it clears. With the dashboard's defaults (general surgery with subspecialties, 6 surgeons, 24 referrals a week, 0.5 extra lists, booking to averages, each surgeon's own list; 200 patients waiting, 35% over 6 weeks, the longest at 30), today's list is all treated by about week 10, but 95% within 6 weeks isn't held until about week 15, ranging from week 12 to 20 across five runs. One extra list a week instead of half brings that forward by 4.0 weeks (± 0.9). Meeting the target by week 26 needs about 0.1 extra lists a week, and by week 13 about 0.8.
+- Where the backlog sits matters. Putting 100 of the 200 patients on one surgeon (70% of them past 6 weeks) and 20 recent referrals on each of the others leaves about 38 patients over target after 13 weeks, against 11 when the same backlog is shared evenly. The target is met at about week 25 (week 14 to 41 across five runs) rather than week 17 for the evenly shared version, and today's list takes until about week 15 to clear rather than week 10. Pooling lists within subspecialty removes most of that difference (section 6.9).
+
+### 6.9 Subspecialties and pooled waiting lists
+
+Code: [`synthetic.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/src/theatre_sched/synthetic.py) (`SUBSPECIALTIES`), [`rolling.py`](https://github.com/jackcormacwright1/theatre_scheduler/blob/main/src/theatre_sched/rolling.py) (`pooling`)
+
+**Why subspecialties come first.** Pooling only makes sense between surgeons who do the operation: an otologist wouldn't take a patient waiting for sinus surgery. In Parts 1 and 2 each surgeon does a random 4–6 of the specialty's six procedures, which is fine for one surgeon's list but would let pooling pass patients between surgeons who would never swap them. So the dashboard's hospitals give each surgeon one subspecialty interest instead. A surgeon does the specialty's shared procedures plus their subspecialty's, and interests are given out in turn (S1 the first, S2 the second, and so on, starting again after the last):
+
+| Specialty | Everyone | Subspecialties |
+|---|---|---|
+| General surgery | skin lesion excision, umbilical and inguinal hernia repair | upper GI: lap. cholecystectomy, incisional hernia repair · colorectal: haemorrhoidectomy, incisional hernia repair |
+| Orthopaedics | (none) | hip and knee arthroplasty: hip and knee replacement · knee and sports: knee arthroscopy, ACL reconstruction, knee replacement · upper limb: carpal tunnel release, shoulder arthroscopy |
+| Gynaecology | operative hysteroscopy, diagnostic laparoscopy, lap. ovarian cystectomy | minimal access: endometriosis excision, total lap. hysterectomy · urogynaecology: vaginal hysterectomy and repair · general gynaecology: total lap. hysterectomy |
+| ENT | grommet insertion, tonsillectomy | rhinology: septoplasty, endoscopic sinus surgery · head and neck: microlaryngoscopy, thyroidectomy · otology: (shared cases only) |
+
+Like the rest of the world, this is illustrative. The six modelled procedures are a small part of a real case mix, so, for example, the otologists' ear operations aren't modelled at all, and in this model they take only grommets and tonsils. Referrals are shared so that each surgeon's demand needs the same theatre time (section 6.2).
+
+**Pooled lists.** With `pooling = "pooled"`, a patient can be operated on by any surgeon $k$ who does their procedure. Each week:
+
+1. All waiting patients go into one queue in the booking order (section 6.4), ranked as before using their referring surgeon's expected times.
+2. The week's lists are taken in date order (surgeon order within a day). Each patient in turn goes on the **earliest list, of any surgeon who does their procedure, where they fit** under the booking rule, judged with that surgeon's numbers: their historical average for the procedure (average rule), or the planner's draws for that surgeon and procedure (Monte Carlo rule).
+3. On the day, each list runs longest-expected first and applies the cancellation rule as in section 6.5, with the operating surgeon's expected and true times.
+
+Extra lists go to the surgeon with the most expected minutes of due patients they could take, so a due patient counts towards every surgeon who could take them. A list is **short of patients** if no patient that surgeon could take was left unbooked.
+
+**A case's time depends on who operates.** The patient's true time with their own surgeon $s$ is $y_i = \exp(\mu_{s p} + \sigma_{s p}\, z_i)$, where $z_i$ is a standard normal draw: the patient's own **complexity**, how far their case sits above or below that surgeon's typical time. With another surgeon $k$ who does the procedure, the same complexity is kept and the surgeon's own parameters are used:
+
+$$z_i = \frac{\log y_i - \mu_{s p}}{\sigma_{s p}}, \qquad y_i^{(k)} = \exp(\mu_{k p} + \sigma_{k p}\, z_i)$$
+
+So a difficult case stays difficult whoever operates, and a fast surgeon is still fast. Because $\sigma$ is set by procedure here, the case takes the same multiple of each surgeon's typical time.
+
+> **Worked example.** A patient is referred to S1 (upper GI) for a laparoscopic cholecystectomy. S1's typical time is 107 minutes and $\sigma = 0.35$, and with S1 this case would take 125 minutes, so $z = \log(125/107)/0.35 = 0.155/0.35 = 0.44$. S3, also upper GI, typically takes 85 minutes, so with S3 the case takes $85 \times e^{0.35 \times 0.44} = 85 \times 1.17 = 99$ minutes. S2 (colorectal) doesn't do cholecystectomies, so can't take the patient.
+
+The planner's view is built the same way: for each surgeon who does the procedure it has that surgeon's estimate for the procedure (and, for the Monte Carlo rule, 500 draws from it, on their own random number stream). With their own surgeon, a patient's true time, expected time and draws are exactly those used for own-surgeon lists, so a pooled scenario differs from an own-list scenario only through who operates on whom.
+
+**Findings** (dashboard defaults as in section 6.8, five runs, pooled against own lists on the same patients):
+
+- **A backlog on one surgeon.** With 100 of the 200 patients on S1, pooling brings the week the target is first met from about 25 to about 12 (13.8 weeks sooner, ± 7.6), leaves about 9 patients over target after 13 weeks rather than 38, and clears today's list by week 8 rather than 15. The 95th-percentile wait of patients treated falls from 117 to 66 days.
+- **Even with the backlog shared evenly**, pooling meets the target 5.2 weeks sooner (± 1.5), halves the median wait (18 to 10 days) and treats about 19 more patients a year (± 9).
+- **Pooled lists are packed tighter.** A larger queue gives more ways to fill each list, so lists booked to average times at 100% fill end closer to the full session and overrun more: 19% of lists rather than 14%, with 4.3 rather than 3.2 cancellations per 100 booked. Filling pooled lists to 95% brings overruns back to the own-list rate (13% against 14%), and the concentrated backlog still meets the target 12.4 weeks sooner (± 6.3). The same happens with Monte Carlo booking, where overruns rise from 4.6% to 6.8% at a 10% limit.
+- **More lists run short of patients, not fewer** (48% rather than 37% with the even backlog). Pooling clears the list sooner, and the first lists of each week take the patients who are ready, so later lists run short. Own lists hide the same spare time as patients waiting for one particular surgeon.
+- **Orthopaedics gains least.** None of its procedures is shared across the whole specialty, and at 24 referrals a week its demand is more than its lists can take, so there is little spare time to pool.
+
+Pooling assumes patients accept any surgeon in the subspecialty and that any of those surgeons' lists suits them. It ignores consultant continuity, follow-up arrangements and surgeons' own preferences, all of which limit pooling in practice.
 
 ---
 
@@ -386,13 +431,14 @@ Code: [`scenarios.py`](https://github.com/jackcormacwright1/theatre_scheduler/bl
 
 ## 8. Checking the work
 
-Code: [`tests/`](https://github.com/jackcormacwright1/theatre_scheduler/tree/main/tests) (42 automated tests, run with `pytest`)
+Code: [`tests/`](https://github.com/jackcormacwright1/theatre_scheduler/tree/main/tests) (45 automated tests, run with `pytest`)
 
 - **The Monte Carlo against a known answer.** For a single lognormal case, the simulated overrun probability matches the exact tail probability within 4 Monte Carlo standard errors.
 - **Arithmetic of lists.** Changeovers are counted between cases only. Fixed durations give certain outcomes. Touch time excludes changeovers and overrun (the worked example in section 4 is a test).
 - **The duration fit.** With plenty of data, the plug-in estimates recover the true parameters. Sparse pairs borrow the pooled spread.
 - **The hierarchical model.** With plenty of data it agrees with the plug-in estimates. A pair with one unusual case is pulled towards the prior, lands between its own average and the prior, and keeps a wide posterior. Draws for two patients of the same pair are correlated, and draws for different pairs aren't. A pair with no history gets the prior. Across synthetic worlds, $\hat\tau$ recovers the true surgeon–procedure deviation (0.08), and is larger without the surgeon effect, as it should be. Choosing a duration model leaves the patients and their true case times unchanged.
 - **Starting from today's list.** The starting waits have the share over target asked for, none beyond the longest wait, and the triangular mean beyond the target. The week the target is met needs 4 weeks in a row (a single good week doesn't count). A run starts with exactly the list asked for, however it is described, and settled runs give exactly the same results as before the option was added. More extra lists leave fewer patients over target after 26 weeks, and a backlog concentrated on one surgeon clears more slowly than the same backlog shared. Pasted counts are read in the formats listed above, a band straddling the target counts in proportion, and an extract with more surgeons than the scenario is refused with a message saying how many are needed.
+- **Subspecialties and pooled lists.** Each surgeon does exactly the shared procedures plus their subspecialty's. With pooled lists, every patient operated on was operated on by a surgeon who does their procedure (the otologists only ever take grommets and tonsils), some patients do move between surgeons, and a patient's case with their own surgeon takes exactly what it would on an own list. Own-list runs give exactly the same results as before pooling was added. A backlog on one surgeon leaves fewer patients over target after 26 weeks and clears sooner when lists are pooled.
 - **Schedulers.** No patient is booked twice, or on another surgeon's list. Every chance-constrained list meets its limit on the planning draws, and booking to averages respects the fill fraction.
 - **The year-long simulation.**
   - No patient is operated on before being added.
@@ -408,7 +454,7 @@ Three investigations during development changed the model or its interpretation:
 
 1. **Was the plug-in planner's poor calibration a bug, or small samples?** Rerunning Part 1 with 200 past cases per pair made the plug-in planner match the true-durations planner. That confirmed small samples.
 2. **Abrupt waiting-time thresholds.** Without leave, waiting times jumped from failing to meeting every target within half a list a week, which is unrealistic. Adding two-week leave blocks (a 42-week operating year) gave the gradual curves reported.
-3. **Unexpectedly low utilisation.** Rough arithmetic suggested higher touch utilisation than the simulation produced. Tracing it showed lists running short of patients, because each list can only be filled from its own surgeon's queue. The "short of patients" measure was added to report it.
+3. **Unexpectedly low utilisation.** Rough arithmetic suggested higher touch utilisation than the simulation produced. Tracing it showed lists running short of patients, because each list can only be filled from its own surgeon's queue. The "short of patients" measure was added to report it, and later pooled lists (section 6.9).
 4. **Are the hierarchical model's intervals honest?** Across 30 worlds, the 90% posterior intervals for the pair averages contained the true value 80% of the time with a median of 3 past cases per pair, 83% with 15, 87% with 50 and 89% with 200. They are somewhat too narrow when data are sparse, because the fit treats $\hat\sigma_p$ and $\hat\tau$ as known. This is one reason the hierarchical planner improves on the plug-in planner's calibration without reaching the true-durations planner's (see the README).
 
 ---
@@ -419,7 +465,8 @@ Three investigations during development changed the model or its interpretation:
 |---|---|---|
 | All parameters are synthetic and illustrative | No real data is used | The results show mechanisms and directions, not magnitudes for any real service |
 | Lognormal durations, independent between cases | A standard model for surgical times | Real lists have shared effects (a late start, a junior team), so overruns are probably more likely than modelled |
-| Patients wait for their own consultant (no pooling) | A common arrangement | This is the main cause of lists running short of patients. Pooled lists would raise utilisation and cut the lists needed |
+| Patients wait for their own consultant, unless lists are pooled | A common arrangement | Own lists can't share a backlog. Pooled lists (section 6.9) assume any surgeon in the subspecialty is acceptable to the patient, which overstates what pooling achieves in practice |
+| Each surgeon has one subspecialty interest, given out in turn (dashboard) | Pooling only makes sense between surgeons who do the operation | Real job plans mix interests and sessions more than this |
 | Steady demand, with no seasonality or winter cancellations | Keeps the comparison clean | Real capacity needs are higher and lumpier |
 | The planner's estimates are fixed at the start and never updated | Simplicity | Understates how much the planner would learn over a year |
 | Case time is patient in theatre to patient out, with fixed changeovers | Simplicity | Touch utilisation is lower than many trusts report. The 5-minute changeover scenario approximates parallel anaesthetic rooms |
@@ -438,7 +485,8 @@ Three investigations during development changed the model or its interpretation:
 | Surgeon speed spread (log scale) | 0.15 | World |
 | Surgeon–procedure deviation (log scale) | 0.08 | World |
 | Past cases per pair | median 15 (log-scale spread 1.0) | World |
-| Procedures per surgeon | 4–6 of 6 | World |
+| Procedures per surgeon | 4–6 of 6 at random (Parts 1–2 and scripts); the shared procedures plus one subspecialty's (dashboard) | World |
+| Waiting lists | each surgeon's own; pooled within subspecialty as an option | Dashboard |
 | Session length $L$ | 480 minutes | All parts |
 | Changeover $c$ | 15 minutes | All parts |
 | Part 1 surgeons, patients each, weeks | 5, 60, 4 | Part 1 |
@@ -463,7 +511,7 @@ Three investigations during development changed the model or its interpretation:
 ## 11. Next steps
 
 1. **A fully Bayesian duration model.** The hierarchical model (section 3.1) treats $\hat\sigma_p$ and $\hat\tau$ as known, which makes its intervals a little too narrow when data are sparse. Fitting the same model by MCMC (in PyMC or Stan) would carry that uncertainty too. The estimates could also be updated as cases happen through the year rather than fixed at the start.
-2. **Pooled lists.** Let any surgeon in the specialty take a patient, with that surgeon's durations.
+2. **Partial pooling of lists.** Let some patients decline to move, or pool only patients past a set wait, to see how much of the pooled gain survives realistic limits.
 3. **Pressure.** Add seasonal demand and winter list cancellations.
 4. **An exact benchmark** for Part 1's heuristic: solve the same sampled problem as an integer programme.
 
