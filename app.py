@@ -12,11 +12,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))  # works without installing the package
 
+# Streamlit reruns this script in the same process after a deploy, with the package's old modules still
+# imported. If any source file has changed since they were loaded, drop them so they are imported afresh.
+_SOURCE_STAMP = max(f.stat().st_mtime for f in (ROOT / "src" / "theatre_sched").glob("*.py"))
+_loaded = sys.modules.get("theatre_sched")
+if _loaded is not None and getattr(_loaded, "_source_stamp", None) != _SOURCE_STAMP:
+    for _name in [m for m in list(sys.modules) if m == "theatre_sched" or m.startswith("theatre_sched.")]:
+        del sys.modules[_name]
+
 import altair as alt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
+import theatre_sched  # noqa: E402
 from theatre_sched.durations import fit_bayes, fit_hierarchical  # noqa: E402
 from theatre_sched.rolling import POLICIES, RollingConfig, implied_load  # noqa: E402
 from theatre_sched.scenarios import (  # noqa: E402
@@ -36,6 +45,8 @@ from theatre_sched.scenarios import (  # noqa: E402
 )
 from theatre_sched.starting_list import CountsError, parse_counts, summarise, to_scenario_bands  # noqa: E402
 from theatre_sched.synthetic import SUBSPECIALTIES, WorldConfig, make_world, surgeon_subspecialties  # noqa: E402
+
+theatre_sched._source_stamp = _SOURCE_STAMP
 
 st.set_page_config(page_title="Theatre list booking simulator", page_icon="🩺", layout="wide")
 
